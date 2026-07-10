@@ -5,6 +5,7 @@
 
 #include "Engine/Engine.h"
 #include "GameFramework/Pawn.h"
+#include "Net/UnrealNetwork.h"
 
 
 UCombatComponent::UCombatComponent()
@@ -17,6 +18,15 @@ void UCombatComponent::TickComponent(float DeltaTime, ELevelTick TickType,
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
 	// ...
+}
+
+void UCombatComponent::GetLifetimeReplicatedProps(TArray<class FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+	
+	DOREPLIFETIME(UCombatComponent, Inventory);
+	DOREPLIFETIME(UCombatComponent, CurrentWeapon);
+	DOREPLIFETIME_CONDITION(UCombatComponent, bAiming, COND_SkipOwner);
 }
 
 void UCombatComponent::Initiate_CycleWeapon()
@@ -42,26 +52,63 @@ void UCombatComponent::Initiate_ReloadWeapon()
 
 void UCombatComponent::Initiate_Aim_Pressed()
 {
-	GEngine->AddOnScreenDebugMessage(-1, 5.f, FColor::Cyan, TEXT("Initiate_Aim_Pressed"), false);
+	Local_Aim(true);
+	Server_Aim(true);
 }
 
 void UCombatComponent::Initiate_Aim_Released()
 {
-	GEngine->AddOnScreenDebugMessage(-1, 5.f, FColor::Cyan, TEXT("Initiate_Aim_Released"), false);
+	Local_Aim(false);
+	Server_Aim(false);
+}
+
+void UCombatComponent::Server_Aim_Implementation(bool bPressed)
+{
+	Local_Aim(bPressed);
+}
+
+void UCombatComponent::Local_Aim(bool bPressed)
+{
+	bAiming = bPressed;
+}
+
+void UCombatComponent::Equip(AWeapon* Weapon)
+{
+	CurrentWeapon = Weapon;
+	CurrentWeapon->AttachToOwningPawn();
 }
 
 void UCombatComponent::SpawnInventory()
 {
-	AWeapon* NewWeapon = SpawnWeapon(DefaultWeaponClass);
-	if (IsValid(NewWeapon))
+	if (GetOwner()->GetLocalRole() < ROLE_Authority) return;
+	
+	for (TSubclassOf<AWeapon>& WeaponClass : DefaultWeaponClass)
 	{
-		NewWeapon->AttachToOwningPawn();
+		AWeapon* Weapon = SpawnWeapon(WeaponClass);
+		Inventory.AddUnique(Weapon);
+	}
+	
+	if (Inventory.Num() > 0)
+	{
+		Equip(Inventory[0]);
 	}
 }
 
 void UCombatComponent::DestroyInventory()
 {
-	//TODO: destroy the inventory once we have one
+	for (AWeapon* Weapon : Inventory)
+	{
+		if (IsValid(Weapon))
+		{
+			Weapon->Destroy();
+		}
+	}
+}
+
+void UCombatComponent::OnRep_CurrentWeapon(AWeapon* LastWeapon)
+{
+	if (!IsValid(CurrentWeapon)) return;
+	CurrentWeapon->AttachToOwningPawn();
 }
 
 AWeapon* UCombatComponent::SpawnWeapon(TSubclassOf<AWeapon> WeaponClass) const
@@ -77,4 +124,8 @@ AWeapon* UCombatComponent::SpawnWeapon(TSubclassOf<AWeapon> WeaponClass) const
 	
 	return GetWorld()->SpawnActor<AWeapon>(WeaponClass, SpawnInfo);
 }
+
+
+
+
 
