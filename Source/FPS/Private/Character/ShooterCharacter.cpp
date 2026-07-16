@@ -42,12 +42,15 @@ AShooterCharacter::AShooterCharacter()
 	
 	Combat = CreateDefaultSubobject<UCombatComponent>("Combat");
 	Combat->SetIsReplicated(true);
+	
+	DefaultFOV = 90.0f;
 }
 
 void AShooterCharacter::BeginPlay()
 {
 	Super::BeginPlay();
 	
+	FirstPersonCamera->SetFieldOfView(DefaultFOV);
 }
 
 void AShooterCharacter::BeginDestroy()
@@ -60,12 +63,96 @@ void AShooterCharacter::BeginDestroy()
 	}
 }
 
+FRotator AShooterCharacter::GetFixedRotation() const
+{
+	FRotator AimRotation = GetBaseAimRotation();
+	if (AimRotation.Pitch > 90.f && !IsLocallyControlled())
+	{
+		// map pitch from [270, 360) to [-90, 0]
+		const FVector2D InRange(270.f, 360.f);
+		const FVector2D OutRange(-90.f, 0.f);
+		
+		AimRotation.Pitch = FMath::GetMappedRangeValueClamped(InRange, OutRange, AimRotation.Pitch);
+	}
+	return AimRotation;
+	
+}
+
+bool AShooterCharacter::HasCurrentWeapon() const
+{
+	return IsValid(Combat) && Combat->CurrentWeapon != nullptr;
+}
+
 
 void AShooterCharacter::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
-
+	CalculateTurnInPlaceParameters();
+	CalculateFABRIKSocketTransform();
+	
 }
+
+void AShooterCharacter::CalculateTurnInPlaceParameters()
+{
+	// Get velocity, see if it's zero
+	// See if we are falling
+	
+	// if standing still and not jumping 
+		// get current aim rotation
+		// get delta aim rotation - the difference in rotation of my current aim rotation from the initial aim rotation
+		// (initial aim rotation is calculated in BeginPlay)
+		// Store the Yaw of the delta aim rotation (AO_Yaw)
+		// if TurningStatus == NotTurning
+			// set InterpAO_Yaw to Ao_Yaw
+		// TurnInPlace() = interpolates the InterpAO_Yaw value to zero.
+	
+	// if running or jumping
+		// reset initial aim rotation to the current actual aim rotation
+		// AO_Yaw = 0
+		// we also need a movement ofset yaw to feed to our strafing blendspaces 
+		// get base aim rotation
+		//get our movement rotation - this is the rotation of our Velocity
+		//Movement Offset Yaw = the delta between our movement roation and our aim rotation
+		// TurninStatus = NotTurning
+		
+	
+	
+// Turn in place
+	// if AO_Yaw > 90
+		// TurningStatus = Right
+	// else if AO_Yaw < - 90 
+		// TurningStatus = Left 
+	// if Turning Status != Not Turning ( we are turning to our left or right)
+		// Interpolate InterpAO_Yaw down to zero.
+		// AO_Yaw = InterpAO_Yaw
+		//if Abs(AO_Yaw) < 5.f
+			// TurningStatus = Not Turning 
+			// reset initial aim rotation to our actual aim rotation
+	
+	
+	
+}
+
+void AShooterCharacter::CalculateFABRIKSocketTransform()
+{
+	if (IsValid(Combat)&& IsValid(Combat->CurrentWeapon)&& IsValid(Combat->CurrentWeapon->GetMesh3P()))
+	{
+		FABRIK_SocketTransform = Combat->CurrentWeapon->GetMesh3P()->GetSocketTransform("FABRIK_Socket", RTS_World);
+		
+		FVector OutLocation;
+		FRotator OutRotation;
+		GetMesh()->TransformToBoneSpace(
+			"hand_r", 
+			FABRIK_SocketTransform.GetLocation(), 
+			FABRIK_SocketTransform.GetRotation().Rotator(), 
+			OutLocation, 
+			OutRotation);
+		FABRIK_SocketTransform.SetLocation(OutLocation);
+		FABRIK_SocketTransform.SetRotation(OutRotation.Quaternion());
+	}
+}
+
+
 
 void AShooterCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 {
@@ -130,10 +217,15 @@ void AShooterCharacter::Input_FireWeapon_Released()
 void AShooterCharacter::Input_Aim_Pressed()
 {
 	Combat->Initiate_Aim_Pressed();
+	OnAim(true);
 }
 
 void AShooterCharacter::Input_Aim_Released()
 {
 	Combat->Initiate_Aim_Released();
+	OnAim(false);
+	
 }
+
+
 

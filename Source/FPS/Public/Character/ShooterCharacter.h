@@ -39,9 +39,28 @@ public:
 		virtual void BeginPlay() override;
     	virtual void BeginDestroy() override;
 	
+		UFUNCTION(BlueprintCallable)
+		FRotator GetFixedRotation() const;
+	
+	UPROPERTY(BlueprintReadOnly, Category="FPS|FABRIK")
+	FTransform FABRIK_SocketTransform;
+	
+	UFUNCTION(BlueprintCallable)
+	bool HasCurrentWeapon() const;
+	
 protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="FPS|Combat")
 	TObjectPtr<UCombatComponent> Combat;
+	
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="FPS|Camera")
+	TObjectPtr<UCameraComponent> FirstPersonCamera;	
+	
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="FPS|Aiming")
+	float DefaultFOV;
+	
+
+	UFUNCTION(BluePrintImplementableEvent)
+	void OnAim(bool bIsAiming);
 
 private:
 	
@@ -52,6 +71,8 @@ private:
 	void Input_Aim_Pressed();
 	void Input_Aim_Released();
 	
+	void CalculateFABRIKSocketTransform();
+	void CalculateTurnInPlaceParameters();
 	
 	
 	
@@ -62,8 +83,6 @@ private:
 	UPROPERTY(VisibleAnywhere)
 	TObjectPtr<USpringArmComponent> SpringArm;
 	
-	UPROPERTY(VisibleAnywhere)
-	TObjectPtr<UCameraComponent> FirstPersonCamera;
 	
 	UPROPERTY(EditAnywhere, Category = "FPS|Input")
 	TObjectPtr<UInputAction> CycleWeaponAction;

@@ -40,9 +40,11 @@ public:
 	UPROPERTY(BlueprintReadOnly, Replicated)
 	bool bAiming;
 	
-protected:
-UPROPERTY(Transient, BlueprintReadOnly, ReplicatedUsing = OnRep_CurrentWeapon)
+	UPROPERTY(Transient, BlueprintReadOnly, ReplicatedUsing = OnRep_CurrentWeapon)
 	TObjectPtr<AWeapon> CurrentWeapon;
+	
+protected:
+
 
 private:
 	
@@ -50,7 +52,7 @@ private:
 	void OnRep_CurrentWeapon(AWeapon* LastWeapon);
 	
 	
-	UPROPERTY(Transient, Replicated)__sdv_retrieve_request()
+	UPROPERTY(Transient, Replicated)
 	
 	TArray<AWeapon*> Inventory;
 	
