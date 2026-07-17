@@ -7,6 +7,7 @@
 #include "GameFramework/Character.h"
 #include "GameFramework/SpringArmComponent.h"
 #include "Interfaces/PlayerInterface.h"
+#include "ShooterTypes/ShooterTypes.h"
 #include "ShooterCharacter.generated.h"
 
 class UCombatComponent;
@@ -61,6 +62,15 @@ protected:
 
 	UFUNCTION(BluePrintImplementableEvent)
 	void OnAim(bool bIsAiming);
+	
+	UPROPERTY(BlueprintReadOnly, Category="FPS|TurnInPlace")
+	float AO_Yaw;
+	
+	UPROPERTY(BlueprintReadOnly, Category="FPS|Strafing")
+	float MovementOffsetYaw;
+	
+	UPROPERTY(BlueprintReadOnly, Category="FPS|TurnInPlace")
+	ETurnInPlace TurningStatus;
 
 private:
 	
@@ -72,9 +82,11 @@ private:
 	void Input_Aim_Released();
 	
 	void CalculateFABRIKSocketTransform();
-	void CalculateTurnInPlaceParameters();
+	void CalculateTurnInPlaceParameters(float DeltaTime);
+	void TurnInPlace(float DeltaTime);
 	
-	
+	FRotator StartingAimRotation;
+	float InterpAO_Yaw;
 	
 	// 1st person view (arms)
 	UPROPERTY(VisibleAnywhere)

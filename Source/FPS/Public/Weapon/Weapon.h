@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "GameplayTagContainer.h"
+#include "Chaos/ChaosEngineInterface.h"
 #include "GameFramework/Actor.h"
 #include "Weapon.generated.h"
 
@@ -23,6 +24,7 @@ public:
 	USkeletalMeshComponent* GetMesh3P() const;
 	
 	void AttachToOwningPawn() const;
+	void WeaponTrace(FHitResult& OutHit, float TraceLength);
 	
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category= "FPS|WeaponType")
 	FGameplayTag WeaponType;
@@ -30,8 +32,20 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="FPS|Aiming")
 	float AimFieldOfView;
 	
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="FPS|Trace")
+	float TraceRadius;
+	
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="FPS|Trace")
+	bool bDrawDebugTrace = false;
+	
+	void Local_Fire(const FVector& ImpactPoint, const FVector& ImpactNormal, TEnumAsByte<EPhysicalSurface> ImpactSurfaceType, bool bIsFirstPerson);
+	
+	
 protected:
 	virtual void BeginPlay() override;
+	
+	UFUNCTION(BlueprintImplementableEvent)
+	void FireEffects(const FVector& ImpactPoint, const FVector& ImpactNormal, EPhysicalSurface ImpactSurfaceType, bool bIsFirstPerson); 
 
 private:
 	

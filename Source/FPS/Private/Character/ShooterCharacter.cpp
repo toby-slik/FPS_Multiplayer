@@ -9,6 +9,8 @@
 #include "Components/SkeletalMeshComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/SpringArmComponent.h"
+#include "Kismet/KismetArrayLibrary.h"
+#include "Kismet/KismetMathLibrary.h"
 
 AShooterCharacter::AShooterCharacter()
 {
@@ -44,6 +46,7 @@ AShooterCharacter::AShooterCharacter()
 	Combat->SetIsReplicated(true);
 	
 	DefaultFOV = 90.0f;
+	TurningStatus = ETurnInPlace::NotTurning;
 }
 
 void AShooterCharacter::BeginPlay()
@@ -51,6 +54,8 @@ void AShooterCharacter::BeginPlay()
 	Super::BeginPlay();
 	
 	FirstPersonCamera->SetFieldOfView(DefaultFOV);
+	
+	StartingAimRotation = FRotator(0.f, GetBaseAimRotation().Yaw, 0.f);
 }
 
 void AShooterCharacter::BeginDestroy()
@@ -87,50 +92,76 @@ bool AShooterCharacter::HasCurrentWeapon() const
 void AShooterCharacter::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
-	CalculateTurnInPlaceParameters();
+	CalculateTurnInPlaceParameters(DeltaTime);
 	CalculateFABRIKSocketTransform();
 	
 }
 
-void AShooterCharacter::CalculateTurnInPlaceParameters()
+void AShooterCharacter::CalculateTurnInPlaceParameters(float DeltaTime)
 {
-	// Get velocity, see if it's zero
-	// See if we are falling
+	FVector Velocity = GetVelocity();
+	Velocity.Z = 0.f;
+	float Speed = Velocity.Size();
+	bool bIsInAir = GetCharacterMovement()->IsFalling();
 	
-	// if standing still and not jumping 
-		// get current aim rotation
-		// get delta aim rotation - the difference in rotation of my current aim rotation from the initial aim rotation
-		// (initial aim rotation is calculated in BeginPlay)
-		// Store the Yaw of the delta aim rotation (AO_Yaw)
-		// if TurningStatus == NotTurning
-			// set InterpAO_Yaw to Ao_Yaw
-		// TurnInPlace() = interpolates the InterpAO_Yaw value to zero.
-	
-	// if running or jumping
-		// reset initial aim rotation to the current actual aim rotation
-		// AO_Yaw = 0
-		// we also need a movement ofset yaw to feed to our strafing blendspaces 
-		// get base aim rotation
-		//get our movement rotation - this is the rotation of our Velocity
-		//Movement Offset Yaw = the delta between our movement roation and our aim rotation
-		// TurninStatus = NotTurning
+	if (Speed == 0.f && !bIsInAir) // standing still, not jumping
+	{
+		FRotator CurrentAimRotation(0.f, GetBaseAimRotation().Yaw, 0.f);
+		// startingAimRotation initially set in beginplay
+		FRotator DeltaAimRotion = UKismetMathLibrary::NormalizedDeltaRotator(CurrentAimRotation, StartingAimRotation);
+		AO_Yaw = DeltaAimRotion.Yaw;
 		
+		if (TurningStatus == ETurnInPlace::NotTurning)
+		{
+			InterpAO_Yaw = AO_Yaw;
+		}
+		
+		TurnInPlace(DeltaTime);
+		
+	}
 	
 	
-// Turn in place
-	// if AO_Yaw > 90
-		// TurningStatus = Right
-	// else if AO_Yaw < - 90 
-		// TurningStatus = Left 
-	// if Turning Status != Not Turning ( we are turning to our left or right)
-		// Interpolate InterpAO_Yaw down to zero.
-		// AO_Yaw = InterpAO_Yaw
-		//if Abs(AO_Yaw) < 5.f
-			// TurningStatus = Not Turning 
-			// reset initial aim rotation to our actual aim rotation
+	if ( Speed > 0.f ||bIsInAir)
+	{
+		StartingAimRotation = FRotator(0.f, GetBaseAimRotation().Yaw, 0.f);
+		AO_Yaw = 0.f;
+		
+		FRotator AimRotation = GetBaseAimRotation();
+		FRotator MovementRotation = UKismetMathLibrary::MakeRotFromX(GetVelocity());
+		MovementOffsetYaw = UKismetMathLibrary::NormalizedDeltaRotator(MovementRotation, AimRotation).Yaw;
+		TurningStatus = ETurnInPlace::NotTurning;
+	}
 	
+	AO_Yaw *= -1.f;
+}
+
+void AShooterCharacter::TurnInPlace(float DeltaTime)
+{
+	if (AO_Yaw > 90.f)
+	{
+		TurningStatus = ETurnInPlace::Right;
+	}
+	else if ( AO_Yaw < -90.f )
+	{
+		TurningStatus = ETurnInPlace::Left;
+		
+	}
 	
-	
+	if (TurningStatus != ETurnInPlace::NotTurning) // we are turning
+	{
+		InterpAO_Yaw = FMath::FInterpTo(InterpAO_Yaw, 0.f, DeltaTime, 4.0f);
+		AO_Yaw = InterpAO_Yaw;
+		if (FMath::Abs(AO_Yaw) < 5.f)
+		{
+			TurningStatus = ETurnInPlace::NotTurning;
+			StartingAimRotation = FRotator(0.f, GetBaseAimRotation().Yaw, 0.f);
+		}
+	}
+
+	// Interpolate InterpAO_Yaw down to zero.
+	// 
+	//if Abs(AO_Yaw) < 5.f
+	// TurningStatus = Not Turning 
 }
 
 void AShooterCharacter::CalculateFABRIKSocketTransform()

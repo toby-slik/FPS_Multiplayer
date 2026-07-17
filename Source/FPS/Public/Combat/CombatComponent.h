@@ -45,6 +45,8 @@ public:
 	
 protected:
 
+	UPROPERTY(EditDefaultsOnly, Category="FPS|Weapon")
+	float TraceLength;
 
 private:
 	
@@ -64,5 +66,11 @@ private:
 	UFUNCTION(Server, Reliable)
 	void Server_Aim(bool bPressed);
 	
+	void Server_FireWeapon(const FHitResult& Hit);
+	
+	UFUNCTION(NetMulticast, Reliable)
+	void Multicast_FireWeapon(const FHitResult& Hit);
+	
 	void Local_Aim(bool bPressed);
+	void Local_FireWeapon();
 };
