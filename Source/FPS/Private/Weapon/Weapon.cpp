@@ -11,7 +11,7 @@
 
 AWeapon::AWeapon()
 {
-	PrimaryActorTick.bCanEverTick = true;
+	PrimaryActorTick.bCanEverTick = false;
 	bReplicates = true;
 	bNetUseOwnerRelevancy = true;
 	
@@ -97,7 +97,13 @@ void AWeapon::WeaponTrace(FHitResult& OutHit, float TraceLength)
 			FCollisionShape::MakeSphere(TraceRadius), 
 			QueryParams,
 			ResponseParams);
-		
+
+		if (!bHit)
+		{
+			// A miss never writes ImpactPoint, leaving it at the world origin
+			OutHit.ImpactPoint = End;
+		}
+
 		if (bDrawDebugTrace)
 		{
 			DrawDebugSphereTraceSingle(

@@ -65,7 +65,7 @@ void UCombatComponent::Local_FireWeapon()
 	Server_FireWeapon(Hit);
 }
 
-void UCombatComponent::Server_FireWeapon(const FHitResult& Hit)
+void UCombatComponent::Server_FireWeapon_Implementation(const FHitResult& Hit)
 {
 	Multicast_FireWeapon(Hit);
 }
@@ -80,6 +80,10 @@ void UCombatComponent::Multicast_FireWeapon_Implementation(const FHitResult& Hit
 	else
 	{
 		ensure(IsValid(WeaponData));
+
+		EPhysicalSurface ImpactSurfaceType = Hit.PhysMaterial.IsValid(false) ? Hit.PhysMaterial->SurfaceType.GetValue() : SurfaceType1;
+		CurrentWeapon->Local_Fire(Hit.ImpactPoint, Hit.ImpactNormal, ImpactSurfaceType, false);
+
 		UAnimMontage* Montage3P = WeaponData->ThirdPersonMontages.FindChecked(CurrentWeapon->WeaponType).FireMontage;
 		USkeletalMeshComponent* Mesh3P = IPlayerInterface::Execute_GetMesh3P(GetOwner());
 		if (IsValid(Montage3P)&& IsValid(Mesh3P))

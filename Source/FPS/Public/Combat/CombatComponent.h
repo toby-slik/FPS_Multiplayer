@@ -66,6 +66,7 @@ private:
 	UFUNCTION(Server, Reliable)
 	void Server_Aim(bool bPressed);
 	
+	UFUNCTION(Server, Reliable)
 	void Server_FireWeapon(const FHitResult& Hit);
 	
 	UFUNCTION(NetMulticast, Reliable)

@@ -33,8 +33,8 @@ void AShooterPlayerController::SetupInputComponent()
 	UEnhancedInputComponent* ShooterInputComponent = CastChecked<UEnhancedInputComponent>(InputComponent);
 	ShooterInputComponent->BindAction(MoveAction, ETriggerEvent::Triggered, this, &ThisClass::Input_Move);
 	ShooterInputComponent->BindAction(LookAction, ETriggerEvent::Triggered, this, &ThisClass::Input_Look);
-	ShooterInputComponent->BindAction(JumpAction, ETriggerEvent::Triggered, this, &ThisClass::Input_Jump);
-	ShooterInputComponent->BindAction(CrouchAction, ETriggerEvent::Triggered, this, &ThisClass::Input_Crouch);
+	ShooterInputComponent->BindAction(JumpAction, ETriggerEvent::Started, this, &ThisClass::Input_Jump);
+	ShooterInputComponent->BindAction(CrouchAction, ETriggerEvent::Started, this, &ThisClass::Input_Crouch);
 	
 	
 	
@@ -72,10 +72,10 @@ void AShooterPlayerController::Input_Move(const FInputActionValue& InputActionVa
 {
 	const FVector2D InputAxisVector = InputActionValue.Get<FVector2D>();
 	const FRotator Rotation = GetControlRotation();
-	const FRotator YawRotaton(0.f, Rotation.Yaw, 0.f);
-	
-	const FVector ForwardDirection = FRotationMatrix(Rotation).GetUnitAxis(EAxis::X);
-	const FVector RightDirection = FRotationMatrix(Rotation).GetUnitAxis(EAxis::Y);
+	const FRotator YawRotation(0.f, Rotation.Yaw, 0.f);
+
+	const FVector ForwardDirection = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::X);
+	const FVector RightDirection = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::Y);
 	
 	if (APawn* ControlledPawn = GetPawn())
 	{

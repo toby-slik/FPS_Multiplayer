@@ -45,17 +45,17 @@ protected:
 	virtual void BeginPlay() override;
 	
 	UFUNCTION(BlueprintImplementableEvent)
-	void FireEffects(const FVector& ImpactPoint, const FVector& ImpactNormal, EPhysicalSurface ImpactSurfaceType, bool bIsFirstPerson); 
+	void FireEffects(const FVector& ImpactPoint, const FVector& ImpactNormal, EPhysicalSurface ImpactSurfaceType, bool bIsFirstPerson);
+
+	//Weapon Mesh: 1st person view
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category= "FPS|Weapon")
+	TObjectPtr<USkeletalMeshComponent> Mesh1P;
+
+	//Weapon Mesh: 3rd person view
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category= "FPS|Weapon")
+	TObjectPtr<USkeletalMeshComponent> Mesh3P;
 
 private:
-	
-	//Weapon Mesh: 1st person view 
-	UPROPERTY(VisibleAnywhere)
-	TObjectPtr<USkeletalMeshComponent> Mesh1P;
-	
-	//Weapon Mesh: 3rd person view 
-	UPROPERTY(VisibleAnywhere)
-	TObjectPtr<USkeletalMeshComponent> Mesh3P;
-	
+
 	void SetMeshVisibilities(APawn* OwningPawn) const;
 };

@@ -17,7 +17,7 @@ public class FPS : ModuleRules
 			
 		});
 
-		PrivateDependencyModuleNames.AddRange(new string[] { "EnhancedInput", "EnhancedInput" });
+		PrivateDependencyModuleNames.AddRange(new string[] { "EnhancedInput" });
 		
 	}
 }

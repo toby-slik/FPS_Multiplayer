@@ -2,7 +2,7 @@
 
 #include "ShooterTypes.generated.h"
 
-UENUM()
+UENUM(BlueprintType)
 enum class ETurnInPlace : uint8
 {
 	Left UMETA(DisplayName = "TurningLeft"),
