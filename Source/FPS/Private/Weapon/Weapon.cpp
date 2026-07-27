@@ -1,4 +1,6 @@
-﻿
+﻿// Copyright Druid Mechanics
+
+
 #include "Weapon/Weapon.h"
 
 #include "KismetTraceUtils.h"
@@ -11,7 +13,7 @@
 
 AWeapon::AWeapon()
 {
-	PrimaryActorTick.bCanEverTick = true;
+	PrimaryActorTick.bCanEverTick = false;
 	bReplicates = true;
 	bNetUseOwnerRelevancy = true;
 	
@@ -28,10 +30,9 @@ AWeapon::AWeapon()
 	Mesh3P->CastShadow = true;
 	Mesh3P->SetupAttachment(Mesh1P);
 	Mesh3P->SetHiddenInGame(true);
-	
+
 	AimFieldOfView = 65.0f;
 	TraceRadius = 5.f;
-	
 }
 
 void AWeapon::OnRep_Instigator()
@@ -89,39 +90,41 @@ void AWeapon::WeaponTrace(FHitResult& OutHit, float TraceLength)
 		const FVector Start = EyesWorldLocation;
 		const FVector End = Start + EyesWorldDirection * TraceLength;
 		
-		const bool bHit = GetWorld()->SweepSingleByChannel(OutHit, 
+		const bool bHit = GetWorld()->SweepSingleByChannel(
+			OutHit, 
 			Start, 
 			End, 
 			FQuat::Identity, 
 			FPSTraceChannels::ECC_Weapon, 
-			FCollisionShape::MakeSphere(TraceRadius), 
+			FCollisionShape::MakeSphere(TraceRadius),
 			QueryParams,
 			ResponseParams);
 		
-		if (bDrawDebugTrace)
+		if (!bHit)
 		{
-			DrawDebugSphereTraceSingle(
-				GetWorld(),
-				Start,
-				End,
-				TraceRadius,
-				EDrawDebugTrace::ForDuration,
-				bHit,
-				OutHit,
-				FColor::Green,
-				FColor::Red,
-				5.f);
+			OutHit.ImpactPoint = End;
 		}
+		
+		/*
+		DrawDebugSphereTraceSingle(
+			GetWorld(),
+			Start,
+			End,
+			TraceRadius,
+			EDrawDebugTrace::ForDuration,
+			bHit,
+			OutHit,
+			FColor::Green,
+			FColor::Red,
+			5.f);*/
 	}
-
 }
 
 void AWeapon::Local_Fire(const FVector& ImpactPoint, const FVector& ImpactNormal,
 	TEnumAsByte<EPhysicalSurface> ImpactSurfaceType, bool bIsFirstPerson)
 {
-	// local fire
+	// local fire stuff...
 	FireEffects(ImpactPoint, ImpactNormal, ImpactSurfaceType, bIsFirstPerson);
-	
 }
 
 void AWeapon::BeginPlay()
@@ -143,5 +146,4 @@ void AWeapon::SetMeshVisibilities(APawn* OwningPawn) const
 		Mesh3P->SetHiddenInGame(false);
 	}
 }
-
 
