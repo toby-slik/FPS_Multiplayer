@@ -50,6 +50,10 @@ protected:
 
 private:
 	
+	bool bTriggerPressed;
+	FTimerHandle FireTimer;
+	void FireTimerFinished();
+	
 	UFUNCTION()
 	void OnRep_CurrentWeapon(AWeapon* LastWeapon);
 	
