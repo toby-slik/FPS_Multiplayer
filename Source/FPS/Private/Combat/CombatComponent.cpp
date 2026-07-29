@@ -101,8 +101,20 @@ void UCombatComponent::FireTimerFinished()
 
 void UCombatComponent::Server_FireWeapon_Implementation(const FHitResult& Hit)
 {
-	if (!IsValid(CurrentWeapon)) return;
-	if (GetNetMode() != NM_ListenServer || !Cast<APawn>(GetOwner())->IsLocallyControlled())
+	if (!IsValid(CurrentWeapon))
+	{
+		return;
+	}
+
+	APawn* OwningPawn = Cast<APawn>(GetOwner());
+	if (!IsValid(OwningPawn))
+	{
+		return;
+	}
+
+	// A locally controlled authority pawn already spent its round in Local_Fire.
+	// Remote clients need the server to spend the authoritative round here.
+	if (!OwningPawn->IsLocallyControlled())
 	{
 		CurrentWeapon->Auth_Fire();
 	}
