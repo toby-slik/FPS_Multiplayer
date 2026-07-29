@@ -1,13 +1,21 @@
-﻿// Fill out your copyright notice in the Description page of Project Settings.
+﻿
 
 #pragma once
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
-#include "Data/WeaponData.h"
-#include "Weapon/Weapon.h"
+#include "GameFramework/Actor.h"
 #include "CombatComponent.generated.h"
 
+
+class UMaterialInstanceDynamic;
+class UWeaponData;
+class AWeapon;
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FReticleChanged, UMaterialInstanceDynamic*, ReticleDynMatInst, const FReticleParams&, ReticleParams);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAmmoCounterChanged, UMaterialInstanceDynamic*, AmmoCounterDynMatInst, int32, RoundsCurrent, int32, RoundsMax);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FRoundFired, int32, RoundsCurrent, int32, RoundsMax);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAimingStatusChanged, bool, bIsAiming);
 
 UCLASS(ClassGroup=(Custom), meta=(BlueprintSpawnableComponent))
 class FPS_API UCombatComponent : public UActorComponent
@@ -16,11 +24,13 @@ class FPS_API UCombatComponent : public UActorComponent
 
 public:
 	UCombatComponent();
-	virtual void TickComponent(float DeltaTime, ELevelTick TickType,
-							   FActorComponentTickFunction* ThisTickFunction) override;
+	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 	virtual void GetLifetimeReplicatedProps(TArray<class FLifetimeProperty>& OutLifetimeProps) const override;
-
-	// cycle to the next weapon in the inventroy
+	
+	UFUNCTION(BlueprintPure, Category = "FPS|Combat")
+	static UCombatComponent* FindCombatComponent(const AActor* Actor) { return ( IsValid(Actor) ? Actor->FindComponentByClass<UCombatComponent>() : nullptr ); }
+	
+	// Cycle to the next weapon in the inventory
 	void Initiate_CycleWeapon();
 	void Initiate_FireWeapon_Pressed();
 	void Initiate_FireWeapon_Released();
@@ -28,10 +38,20 @@ public:
 	void Initiate_Aim_Pressed();
 	void Initiate_Aim_Released();
 	
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="FPS|Weapon")
-	TObjectPtr<UWeaponData> WeaponData;
+	UPROPERTY(BlueprintAssignable)
+	FReticleChanged OnReticleChanged;
 	
-
+	UPROPERTY(BlueprintAssignable)
+	FAmmoCounterChanged OnAmmoCounterChanged;
+	
+	UPROPERTY(BlueprintAssignable)
+	FRoundFired OnRoundFired;
+	
+	UPROPERTY(BlueprintAssignable)
+	FAimingStatusChanged OnAimingStatusChanged;
+	
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Weapon")
+	TObjectPtr<UWeaponData> WeaponData;
 	
 	void Equip(AWeapon* Weapon);
 	void SpawnInventory();
@@ -43,11 +63,11 @@ public:
 	UPROPERTY(Transient, BlueprintReadOnly, ReplicatedUsing = OnRep_CurrentWeapon)
 	TObjectPtr<AWeapon> CurrentWeapon;
 	
+	void InitializeWeaponWidgets() const;
 protected:
-
-	UPROPERTY(EditDefaultsOnly, Category="FPS|Weapon")
+	
+	UPROPERTY(EditDefaultsOnly, Category = "FPS|Weapon")
 	float TraceLength;
-
 private:
 	
 	bool bTriggerPressed;
@@ -57,12 +77,10 @@ private:
 	UFUNCTION()
 	void OnRep_CurrentWeapon(AWeapon* LastWeapon);
 	
-	
 	UPROPERTY(Transient, Replicated)
-	
 	TArray<AWeapon*> Inventory;
 	
-	UPROPERTY(EditDefaultsOnly, Category= "FPS|Weapon")
+	UPROPERTY(EditDefaultsOnly, Category = "FPS|Weapon")
 	TArray<TSubclassOf<AWeapon>> DefaultWeaponClass;
 	
 	AWeapon* SpawnWeapon(TSubclassOf<AWeapon> WeaponClass) const;
@@ -70,6 +88,7 @@ private:
 	UFUNCTION(Server, Reliable)
 	void Server_Aim(bool bPressed);
 	
+	UFUNCTION(Server, Reliable)
 	void Server_FireWeapon(const FHitResult& Hit);
 	
 	UFUNCTION(NetMulticast, Reliable)

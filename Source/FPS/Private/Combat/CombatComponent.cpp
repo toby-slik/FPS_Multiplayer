@@ -1,32 +1,37 @@
-﻿// Fill out your copyright notice in the Description page of Project Settings.
+﻿
 
 
 #include "Combat/CombatComponent.h"
 
 #include "TimerManager.h"
 #include "Animation/AnimInstance.h"
+#include "Animation/AnimMontage.h"
 #include "Components/SkeletalMeshComponent.h"
+#include "Data/WeaponData.h"
 #include "Engine/Engine.h"
 #include "GameFramework/Pawn.h"
 #include "Interfaces/PlayerInterface.h"
 #include "Net/UnrealNetwork.h"
 #include "PhysicalMaterials/PhysicalMaterial.h"
+#include "Weapon/Weapon.h"
 
 
 UCombatComponent::UCombatComponent()
 {
 	PrimaryComponentTick.bCanEverTick = true;
-	
+
 	TraceLength = 20'000;
 	bAiming = false;
 	bTriggerPressed = false;
 }
+
+
+
 void UCombatComponent::TickComponent(float DeltaTime, ELevelTick TickType,
                                      FActorComponentTickFunction* ThisTickFunction)
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
-
-	// ...
+	
 }
 
 void UCombatComponent::GetLifetimeReplicatedProps(TArray<class FLifetimeProperty>& OutLifetimeProps) const
@@ -40,12 +45,17 @@ void UCombatComponent::GetLifetimeReplicatedProps(TArray<class FLifetimeProperty
 
 void UCombatComponent::Initiate_CycleWeapon()
 {
-	GEngine->AddOnScreenDebugMessage(-1, 5.f, FColor::Cyan, TEXT("Initiate_CycleWeapon"), false);
+	GEngine->AddOnScreenDebugMessage(
+		-1, 
+		5.f, 
+		FColor::Cyan, 
+		TEXT("Initiate_CycleWeapon"), 
+		false);
 }
 
 void UCombatComponent::Initiate_FireWeapon_Pressed()
 {
-	if (!IsValid(CurrentWeapon)) return; 
+	if (!IsValid(CurrentWeapon)) return;
 	
 	bTriggerPressed = true;
 	
@@ -59,9 +69,10 @@ void UCombatComponent::Local_FireWeapon()
 {
 	if (!IsValid(CurrentWeapon)) return;
 	ensure(IsValid(WeaponData));
+	
 	UAnimMontage* Montage1P = WeaponData->FirstPersonMontages.FindChecked(CurrentWeapon->WeaponType).FireMontage;
 	USkeletalMeshComponent* Mesh1P = IPlayerInterface::Execute_GetMesh1P(GetOwner());
-	if (IsValid(Montage1P)&& IsValid(Mesh1P))
+	if (IsValid(Montage1P) && IsValid(Mesh1P))
 	{
 		Mesh1P->GetAnimInstance()->Montage_Play(Montage1P);
 	}
@@ -71,6 +82,8 @@ void UCombatComponent::Local_FireWeapon()
 	
 	EPhysicalSurface ImpactSurfaceType = Hit.PhysMaterial.IsValid(false) ? Hit.PhysMaterial->SurfaceType.GetValue() : SurfaceType1;
 	CurrentWeapon->Local_Fire(Hit.ImpactPoint, Hit.ImpactNormal, ImpactSurfaceType, true);
+	
+	OnRoundFired.Broadcast(CurrentWeapon->Ammo, CurrentWeapon->MagCapacity);
 	
 	GetWorld()->GetTimerManager().SetTimer(FireTimer, this, &ThisClass::FireTimerFinished, CurrentWeapon->FireTime);
 	Server_FireWeapon(Hit);
@@ -86,7 +99,7 @@ void UCombatComponent::FireTimerFinished()
 	}
 }
 
-void UCombatComponent::Server_FireWeapon(const FHitResult& Hit)
+void UCombatComponent::Server_FireWeapon_Implementation(const FHitResult& Hit)
 {
 	if (!IsValid(CurrentWeapon)) return;
 	if (GetNetMode() != NM_ListenServer || !Cast<APawn>(GetOwner())->IsLocallyControlled())
@@ -107,9 +120,13 @@ void UCombatComponent::Multicast_FireWeapon_Implementation(const FHitResult& Hit
 	else
 	{
 		ensure(IsValid(WeaponData));
+		
+		EPhysicalSurface ImpactSurfaceType = Hit.PhysMaterial.IsValid(false) ? Hit.PhysMaterial->SurfaceType.GetValue() : SurfaceType1;
+		CurrentWeapon->Local_Fire(Hit.ImpactPoint, Hit.ImpactNormal, ImpactSurfaceType, false);
+	
 		UAnimMontage* Montage3P = WeaponData->ThirdPersonMontages.FindChecked(CurrentWeapon->WeaponType).FireMontage;
 		USkeletalMeshComponent* Mesh3P = IPlayerInterface::Execute_GetMesh3P(GetOwner());
-		if (IsValid(Montage3P)&& IsValid(Mesh3P))
+		if (IsValid(Montage3P) && IsValid(Mesh3P))
 		{
 			Mesh3P->GetAnimInstance()->Montage_Play(Montage3P);
 		}
@@ -123,7 +140,12 @@ void UCombatComponent::Initiate_FireWeapon_Released()
 
 void UCombatComponent::Initiate_ReloadWeapon()
 {
-	GEngine->AddOnScreenDebugMessage(-1, 5.f, FColor::Cyan, TEXT("Initiate_ReloadWeapon"), false);
+	GEngine->AddOnScreenDebugMessage(
+		-1, 
+		5.f, 
+		FColor::Cyan, 
+		TEXT("Initiate_ReloadWeapon"), 
+		false);
 }
 
 void UCombatComponent::Initiate_Aim_Pressed()
@@ -143,13 +165,11 @@ void UCombatComponent::Server_Aim_Implementation(bool bPressed)
 	Local_Aim(bPressed);
 }
 
-
-
 void UCombatComponent::Local_Aim(bool bPressed)
 {
 	bAiming = bPressed;
+	OnAimingStatusChanged.Broadcast(bAiming);
 }
-
 
 
 void UCombatComponent::Equip(AWeapon* Weapon)
@@ -171,6 +191,7 @@ void UCombatComponent::SpawnInventory()
 	if (Inventory.Num() > 0)
 	{
 		Equip(Inventory[0]);
+		InitializeWeaponWidgets();
 	}
 }
 
@@ -185,10 +206,21 @@ void UCombatComponent::DestroyInventory()
 	}
 }
 
+void UCombatComponent::InitializeWeaponWidgets() const
+{
+	if (IsValid(CurrentWeapon))
+	{
+		OnReticleChanged.Broadcast(CurrentWeapon->GetReticleDynamicMaterialInstance(), CurrentWeapon->ReticleParams);
+		OnAmmoCounterChanged.Broadcast(CurrentWeapon->GetAmmoCounterDynamicMaterialInstance(), CurrentWeapon->Ammo, CurrentWeapon->MagCapacity);
+	}
+}
+
 void UCombatComponent::OnRep_CurrentWeapon(AWeapon* LastWeapon)
 {
 	if (!IsValid(CurrentWeapon)) return;
 	CurrentWeapon->AttachToOwningPawn();
+	IPlayerInterface::Execute_WeaponReplicated(GetOwner());
+	InitializeWeaponWidgets();
 }
 
 AWeapon* UCombatComponent::SpawnWeapon(TSubclassOf<AWeapon> WeaponClass) const
@@ -204,8 +236,4 @@ AWeapon* UCombatComponent::SpawnWeapon(TSubclassOf<AWeapon> WeaponClass) const
 	
 	return GetWorld()->SpawnActor<AWeapon>(WeaponClass, SpawnInfo);
 }
-
-
-
-
 

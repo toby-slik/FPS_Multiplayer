@@ -9,6 +9,7 @@
 #include "GameFramework/Pawn.h"
 #include "Interfaces/PlayerInterface.h"
 #include "Kismet/KismetMathLibrary.h"
+#include "Materials/MaterialInstanceDynamic.h"
 
 
 AWeapon::AWeapon()
@@ -35,7 +36,7 @@ AWeapon::AWeapon()
 	TraceRadius = 5.f;
 	FireTime = 0.1f;
 	MagCapacity = 10;
-	Ammo = 5;
+	Ammo = 30;
 	StartingCarriedAmmo = 10;
 	Sequence = 0;
 }
@@ -54,6 +55,24 @@ USkeletalMeshComponent* AWeapon::GetMesh1P() const
 USkeletalMeshComponent* AWeapon::GetMesh3P() const
 {
 	return Mesh3P;
+}
+
+UMaterialInstanceDynamic* AWeapon::GetReticleDynamicMaterialInstance()
+{
+	if (!IsValid(DynMatInst_Reticle))
+	{
+		DynMatInst_Reticle = UMaterialInstanceDynamic::Create(ReticleMaterial, this);
+	}
+	return DynMatInst_Reticle;
+}
+
+UMaterialInstanceDynamic* AWeapon::GetAmmoCounterDynamicMaterialInstance()
+{
+	if (!IsValid(DynMatInst_AmmoCounter))
+	{
+		DynMatInst_AmmoCounter = UMaterialInstanceDynamic::Create(AmmoCounterMaterial, this);
+	}
+	return DynMatInst_AmmoCounter;
 }
 
 void AWeapon::AttachToOwningPawn() const

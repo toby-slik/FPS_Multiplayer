@@ -1,11 +1,9 @@
+// Copyright Druid Mechanics
 
 #pragma once
 
 #include "CoreMinimal.h"
-#include "InputAction.h"
-#include "Camera/CameraComponent.h"
 #include "GameFramework/Character.h"
-#include "GameFramework/SpringArmComponent.h"
 #include "Interfaces/PlayerInterface.h"
 #include "ShooterTypes/ShooterTypes.h"
 #include "ShooterCharacter.generated.h"
@@ -14,6 +12,9 @@ class UCombatComponent;
 class UCameraComponent;
 class USpringArmComponent;
 class UInputAction;
+class AWeapon;
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FWeaponFirstReplicated, AWeapon*, Weapon);
 
 UCLASS()
 class FPS_API AShooterCharacter : public ACharacter, public IPlayerInterface
@@ -23,55 +24,57 @@ class FPS_API AShooterCharacter : public ACharacter, public IPlayerInterface
 public:
 	AShooterCharacter();
 	
-	
 	virtual void Tick(float DeltaTime) override;
 	virtual void SetupPlayerInputComponent(class UInputComponent* PlayerInputComponent) override;
 	virtual void PossessedBy(AController* NewController) override;
-	
+	virtual void OnRep_PlayerState() override;
 	
 	/** PlayerInterface */
 	virtual FName GetWeaponAttachPoint_Implementation(const FGameplayTag& WeaponType) const override;
 	virtual USkeletalMeshComponent* GetMesh1P_Implementation() const override;
 	virtual USkeletalMeshComponent* GetMesh3P_Implementation() const override;
+	virtual void WeaponReplicated_Implementation() override;
+	virtual AWeapon* GetCurrentWeapon_Implementation() override;
+	/** ~PlayerInterface */
 	
+	virtual void BeginPlay() override;
+	virtual void BeginDestroy() override;
 	
-	/** PlayerInterface */
-
-		virtual void BeginPlay() override;
-    	virtual void BeginDestroy() override;
+	UFUNCTION(BlueprintCallable)
+	FRotator GetFixedRotation() const;
 	
-		UFUNCTION(BlueprintCallable)
-		FRotator GetFixedRotation() const;
-	
-	UPROPERTY(BlueprintReadOnly, Category="FPS|FABRIK")
+	UPROPERTY(BlueprintReadOnly, Category = "FPS|FABRIK")
 	FTransform FABRIK_SocketTransform;
 	
 	UFUNCTION(BlueprintCallable)
 	bool HasCurrentWeapon() const;
 	
+	UPROPERTY(BlueprintAssignable)
+	FWeaponFirstReplicated OnWeaponFirstReplicated;
+	
+	bool HasWeaponFirstReplicated() const { return bWeaponFirstReplicated; }
 protected:
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="FPS|Combat")
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "FPS|Combat")
 	TObjectPtr<UCombatComponent> Combat;
 	
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="FPS|Camera")
-	TObjectPtr<UCameraComponent> FirstPersonCamera;	
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "FPS|Camera")
+	TObjectPtr<UCameraComponent> FirstPersonCamera;
 	
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="FPS|Aiming")
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Aiming")
 	float DefaultFOV;
 	
-
-	UFUNCTION(BluePrintImplementableEvent)
+	UFUNCTION(BlueprintImplementableEvent)
 	void OnAim(bool bIsAiming);
 	
-	UPROPERTY(BlueprintReadOnly, Category="FPS|TurnInPlace")
+	UPROPERTY(BlueprintReadOnly, Category = "FPS|TurnInPlace")
 	float AO_Yaw;
 	
-	UPROPERTY(BlueprintReadOnly, Category="FPS|Strafing")
+	UPROPERTY(BlueprintReadOnly, Category = "FPS|Strafing")
 	float MovementOffsetYaw;
 	
-	UPROPERTY(BlueprintReadOnly, Category="FPS|TurnInPlace")
+	UPROPERTY(BlueprintReadOnly, Category = "FPS|TurnInPlace")
 	ETurnInPlace TurningStatus;
-
+	
 private:
 	
 	void Input_CycleWeapon();
@@ -85,6 +88,7 @@ private:
 	void CalculateTurnInPlaceParameters(float DeltaTime);
 	void TurnInPlace(float DeltaTime);
 	
+	bool bWeaponFirstReplicated;
 	FRotator StartingAimRotation;
 	float InterpAO_Yaw;
 	
@@ -94,7 +98,6 @@ private:
 	
 	UPROPERTY(VisibleAnywhere)
 	TObjectPtr<USpringArmComponent> SpringArm;
-	
 	
 	UPROPERTY(EditAnywhere, Category = "FPS|Input")
 	TObjectPtr<UInputAction> CycleWeaponAction;
