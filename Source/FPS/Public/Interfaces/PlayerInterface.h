@@ -38,4 +38,20 @@ public:
 	
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
 	AWeapon* GetCurrentWeapon();
+
+	/** True only while the sprint state is active. Sliding, jumping and (later) wall-running are NOT sprinting. */
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
+	bool IsSprinting() const;
+
+	/** Ends sprinting only. Must never interrupt a slide, a jump or any other movement state. */
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
+	void CancelSprint();
+
+	/** True while a slide is in progress. The slide owns the crouched state for its duration. */
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
+	bool IsSliding() const;
+
+	/** Ends an in-progress slide early. No effect when not sliding. */
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
+	void CancelSlide();
 };

@@ -9,6 +9,7 @@
 #include "Engine/LocalPlayer.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
+#include "Interfaces/PlayerInterface.h"
 
 AShooterPlayerController::AShooterPlayerController()
 {
@@ -34,7 +35,10 @@ void AShooterPlayerController::SetupInputComponent()
 	ShooterInputComponent->BindAction(MoveAction, ETriggerEvent::Triggered, this, &ThisClass::Input_Move);
 	ShooterInputComponent->BindAction(LookAction, ETriggerEvent::Triggered, this, &ThisClass::Input_Look);
 	ShooterInputComponent->BindAction(JumpAction, ETriggerEvent::Triggered, this, &ThisClass::Input_Jump);
-	ShooterInputComponent->BindAction(CrouchAction, ETriggerEvent::Triggered, this, &ThisClass::Input_Crouch);
+	// Started, not Triggered: IA_Crouch is a Boolean action with no explicit trigger, so
+	// Triggered fires every frame the key is held. Against the toggle in Input_Crouch that
+	// flipped bWantsToCrouch once per frame, which read as crouch/stand flickering.
+	ShooterInputComponent->BindAction(CrouchAction, ETriggerEvent::Started, this, &ThisClass::Input_Crouch);
 	
 	
 	
@@ -42,13 +46,22 @@ void AShooterPlayerController::SetupInputComponent()
  
 void AShooterPlayerController::Input_Crouch()
 {
-	if (!IsValid(GetCharacter())) return;
-	
-	if (UCharacterMovementComponent* CMC = GetCharacter()->GetCharacterMovement(); IsValid(CMC))
+	ACharacter* ControlledCharacter = GetCharacter();
+	if (!IsValid(ControlledCharacter)) return;
+
+	// Slide shares this key with crouch. A second press during a slide cancels it rather than
+	// toggling crouch underneath it - StopSlide uncrouches, so the player ends up standing.
+	if (ControlledCharacter->Implements<UPlayerInterface>() && IPlayerInterface::Execute_IsSliding(ControlledCharacter))
+	{
+		IPlayerInterface::Execute_CancelSlide(ControlledCharacter);
+		return;
+	}
+
+	if (UCharacterMovementComponent* CMC = ControlledCharacter->GetCharacterMovement(); IsValid(CMC))
 	{
 		CMC->bWantsToCrouch = !CMC->bWantsToCrouch;
 	}
-	
+
 }
 
 void AShooterPlayerController::Input_Jump()

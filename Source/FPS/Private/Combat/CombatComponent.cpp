@@ -87,12 +87,34 @@ void UCombatComponent::Initiate_CycleWeapon()
 		false);
 }
 
+bool UCombatComponent::IsOwnerSprinting() const
+{
+	AActor* OwningActor = GetOwner();
+	if (!IsValid(OwningActor) || !OwningActor->Implements<UPlayerInterface>()) return false;
+
+	return IPlayerInterface::Execute_IsSprinting(OwningActor);
+}
+
+void UCombatComponent::CancelOwnerSprint()
+{
+	AActor* OwningActor = GetOwner();
+	if (!IsValid(OwningActor) || !OwningActor->Implements<UPlayerInterface>()) return;
+
+	IPlayerInterface::Execute_CancelSprint(OwningActor);
+}
+
 void UCombatComponent::Initiate_FireWeapon_Pressed()
 {
 	if (!IsValid(CurrentWeapon)) return;
-	
+
+	// Sprinting blocks firing - but the press that breaks the sprint must still shoot.
+	// Cancel first, then fall through to the normal fire path so the first shot is never dropped.
+	// This only ends the sprint state: a slide or a jump in progress is untouched, and firing
+	// while sliding or airborne is allowed.
+	CancelOwnerSprint();
+
 	bTriggerPressed = true;
-	
+
 	if (CurrentWeapon->Ammo > 0)
 	{
 		Local_FireWeapon();
@@ -102,6 +124,12 @@ void UCombatComponent::Initiate_FireWeapon_Pressed()
 void UCombatComponent::Local_FireWeapon()
 {
 	if (!IsValid(CurrentWeapon)) return;
+
+	// Backstop for the "cannot fire while sprinting" rule - covers the auto-fire loop
+	// re-entering through FireTimerFinished. By the time a cancelling press reaches here,
+	// CancelOwnerSprint has already run locally, so that shot still goes off.
+	if (IsOwnerSprinting()) return;
+
 	ensure(IsValid(WeaponData));
 	
 	UAnimMontage* Montage1P = WeaponData->FirstPersonMontages.FindChecked(CurrentWeapon->WeaponType).FireMontage;
@@ -196,6 +224,10 @@ void UCombatComponent::Initiate_ReloadWeapon()
 
 void UCombatComponent::Initiate_Aim_Pressed()
 {
+	// Aiming cancels sprint, then always proceeds. The gate is on the sprint state only,
+	// so aiming stays available while airborne, sliding and later wall-running.
+	CancelOwnerSprint();
+
 	Local_Aim(true);
 	Server_Aim(true);
 }

@@ -102,4 +102,10 @@ private:
 	
 	void Local_Aim(bool bPressed);
 	void Local_FireWeapon();
+
+	/** Sprint state of the owning pawn, asked through IPlayerInterface. */
+	bool IsOwnerSprinting() const;
+
+	/** Ends the owning pawn's sprint. Never affects sliding, jumping or any other movement state. */
+	void CancelOwnerSprint();
 };
