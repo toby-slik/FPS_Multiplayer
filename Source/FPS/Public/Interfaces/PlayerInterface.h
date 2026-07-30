@@ -54,4 +54,7 @@ public:
 	/** Ends an in-progress slide early. No effect when not sliding. */
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
 	void CancelSlide();
+	
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
+	int32 GetReserveAmmo() const; 
 };

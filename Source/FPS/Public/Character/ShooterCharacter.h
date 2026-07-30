@@ -40,6 +40,7 @@ public:
 	virtual void CancelSprint_Implementation() override;
 	virtual bool IsSliding_Implementation() const override;
 	virtual void CancelSlide_Implementation() override;
+	virtual int32 GetReserveAmmo_Implementation() const override;
 	/** ~PlayerInterface */
 	
 	virtual void BeginPlay() override;
