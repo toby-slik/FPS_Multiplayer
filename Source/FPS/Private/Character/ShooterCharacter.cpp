@@ -3,22 +3,30 @@
 
 #include "Character/ShooterCharacter.h"
 
+#include "Character/ShooterMovementComponent.h"
 #include "EnhancedInputComponent.h"
 #include "TimerManager.h"
 #include "Camera/CameraComponent.h"
 #include "Combat/CombatComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Data/WeaponData.h"
+#include "CollisionQueryParams.h"
+#include "Engine/World.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/SpringArmComponent.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "Net/UnrealNetwork.h"
 #include "Weapon/Weapon.h"
 
-AShooterCharacter::AShooterCharacter()
+AShooterCharacter::AShooterCharacter(const FObjectInitializer& ObjectInitializer)
+	// Swaps the stock CharacterMovementComponent for the predicted one. Same subobject name, so
+	// BP_ShooterCharacter picks it up with no re-parenting or rewiring needed.
+	: Super(ObjectInitializer.SetDefaultSubobjectClass<UShooterMovementComponent>(ACharacter::CharacterMovementComponentName))
 {
 	PrimaryActorTick.bCanEverTick = true;
-	
+
+	ShooterMovement = Cast<UShooterMovementComponent>(GetCharacterMovement());
+
 	GetCharacterMovement()->MovementState.bCanCrouch = true;
 
 	SpringArm = CreateDefaultSubobject<USpringArmComponent>("SpringArm");
@@ -54,6 +62,8 @@ AShooterCharacter::AShooterCharacter()
 
 	bSprinting = false;
 	bSliding = false;
+	bWallRunning = false;
+	WallRunSide = EWallRunSide::None;
 
 	WalkSpeed = 600.f;
 	SprintSpeed = 900.f;
@@ -66,12 +76,41 @@ AShooterCharacter::AShooterCharacter()
 	SlideGroundFriction = 0.2f;
 	SlideBrakingDeceleration = 500.f;
 	SlideCooldown = 0.75f;
+	SlideInputBufferTime = 0.35f;
 
-	// Far enough in the past that the cooldown never blocks the first slide of a life.
-	LastSlideEndTime = -10000.f;
-	CachedGroundFriction = 8.f;
-	CachedBrakingDeceleration = 2048.f;
-	CachedMaxWalkSpeedCrouched = 300.f;
+	MaxJumpCount = 2;
+	DoubleJumpZVelocity = 600.f;
+	DoubleJumpRedirectAlpha = 0.8f;
+	DoubleJumpDirectionalBoost = 250.f;
+	DoubleJumpMinRedirectSpeed = 400.f;
+	DefaultAirControl = 0.35f;
+
+	WallRunMinSpeed = 400.f;
+	WallRunSpeed = 900.f;
+	WallRunAccelInterpSpeed = 3.f;
+	WallRunDeceleration = 900.f;
+	WallRunGravityScale = 0.15f;
+	WallRunMaxFallSpeed = 200.f;
+	WallRunAirControl = 0.2f;
+	WallRunMaxDuration = 2.f;
+	WallRunTraceDistance = 75.f;
+	WallRunMaxWallNormalZ = 0.25f;
+	WallRunMinGroundClearance = 100.f;
+	WallRunMaxStartVerticalSpeed = 300.f;
+	WallRunMinForwardInputDot = 0.5f;
+	WallRunStickSpeed = 60.f;
+	WallJumpForwardSpeed = 750.f;
+	WallJumpOutwardSpeed = 250.f;
+	WallJumpUpwardSpeed = 550.f;
+	WallRunCooldown = 0.35f;
+	WallRunSameWallCooldown = 1.f;
+	WallRunCameraRoll = 15.f;
+	WallRunCameraRollInterpSpeed = 8.f;
+
+	// All slide / wall run timers and cooldowns now live on UShooterMovementComponent as
+	// countdowns advanced by DeltaTime, because world time differs between client and server
+	// and so can never be replayed correctly.
+	CurrentCameraRoll = 0.f;
 }
 
 void AShooterCharacter::GetLifetimeReplicatedProps(TArray<class FLifetimeProperty>& OutLifetimeProps) const
@@ -82,6 +121,8 @@ void AShooterCharacter::GetLifetimeReplicatedProps(TArray<class FLifetimePropert
 	// its own, so skipping the owner avoids stomping local prediction.
 	DOREPLIFETIME_CONDITION(AShooterCharacter, bSprinting, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(AShooterCharacter, bSliding, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(AShooterCharacter, bWallRunning, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(AShooterCharacter, WallRunSide, COND_SkipOwner);
 }
 
 void AShooterCharacter::BeginPlay()
@@ -92,14 +133,23 @@ void AShooterCharacter::BeginPlay()
 
 	StartingAimRotation = FRotator(0.f, GetBaseAimRotation().Yaw, 0.f);
 
+	// Cached again here because a Blueprint-constructed instance builds its components after the
+	// C++ constructor has run.
+	ShooterMovement = Cast<UShooterMovementComponent>(GetCharacterMovement());
+
 	if (UCharacterMovementComponent* MoveComp = GetCharacterMovement())
 	{
 		// Applied here rather than in the constructor so overrides on BP_ShooterCharacter take effect.
+		// Sprint and slide speeds are no longer written onto MaxWalkSpeed - they come out of
+		// UShooterMovementComponent::GetMaxSpeed, so speed is a pure function of predicted state.
 		MoveComp->MaxWalkSpeed = WalkSpeed;
-		CachedGroundFriction = MoveComp->GroundFriction;
-		CachedBrakingDeceleration = MoveComp->BrakingDecelerationWalking;
-		CachedMaxWalkSpeedCrouched = MoveComp->MaxWalkSpeedCrouched;
+		MoveComp->AirControl = DefaultAirControl;
 	}
+
+	// ACharacter already tracks JumpCurrentCount against JumpMaxCount inside FSavedMove_Character,
+	// so the extra air jump comes out properly client-predicted for free. Set here rather than in
+	// the constructor so MaxJumpCount can be overridden on BP_ShooterCharacter.
+	JumpMaxCount = FMath::Max(1, MaxJumpCount);
 }
 
 void AShooterCharacter::BeginDestroy()
@@ -136,39 +186,24 @@ void AShooterCharacter::Tick(float DeltaTime)
 	Super::Tick(DeltaTime);
 	
 	UpdateMovementState();
+	UpdateCameraRoll(DeltaTime);
 	CalculateTurnInPlaceParameters(DeltaTime);
 	CalculateFABRIKSocketTransform();
 }
 
 void AShooterCharacter::UpdateMovementState()
 {
-	// Only the mover decides when its own states end; proxies just receive the replicated flags.
+	// All the actual decisions now happen inside UShooterMovementComponent, where they are
+	// predicted. This only copies the result onto the replicated anim mirrors.
+	if (!IsValid(ShooterMovement)) return;
+
+	// Simulated proxies never run the prediction, so they keep whatever replication gave them.
 	if (!IsLocallyControlled() && !HasAuthority()) return;
 
-	const UCharacterMovementComponent* MoveComp = GetCharacterMovement();
-	if (!IsValid(MoveComp)) return;
-
-	FVector GroundVelocity = GetVelocity();
-	GroundVelocity.Z = 0.f;
-	const float GroundSpeed = GroundVelocity.Size();
-
-	// A slide decays to a stop rather than snapping out at a fixed time.
-	if (bSliding && GroundSpeed < SlideEndSpeed)
-	{
-		StopSlide();
-	}
-
-	// Don't leave the character looping a sprint animation while standing still.
-	// Owner-only: the server must not race the owning client's own sprint decisions.
-	if (IsLocallyControlled() && bSprinting && !bSliding && !MoveComp->IsFalling())
-	{
-		const bool bNoMovementInput = MoveComp->GetCurrentAcceleration().IsNearlyZero();
-		if (bNoMovementInput && GroundSpeed <= SprintStopSpeed)
-		{
-			Local_SetSprinting(false);
-			Server_SetSprinting(false);
-		}
-	}
+	bSprinting = ShooterMovement->IsSprinting();
+	bSliding = ShooterMovement->IsSliding();
+	bWallRunning = ShooterMovement->IsWallRunning();
+	WallRunSide = ShooterMovement->GetWallRunSide();
 }
 
 void AShooterCharacter::CalculateTurnInPlaceParameters(float DeltaTime)
@@ -357,167 +392,150 @@ void AShooterCharacter::Input_Aim_Released()
 
 void AShooterCharacter::Input_Sprint_Toggle()
 {
-	// Toggle, not hold.
-	const bool bNewSprinting = !bSprinting;
+	if (!IsValid(ShooterMovement)) return;
 
-	// Sliding owns the movement params until it finishes; queueing a sprint mid-slide would fight it.
-	if (bNewSprinting && bSliding) return;
-
-	Local_SetSprinting(bNewSprinting);
-	Server_SetSprinting(bNewSprinting);
-}
-
-void AShooterCharacter::Local_SetSprinting(bool bNewSprinting)
-{
-	bSprinting = bNewSprinting;
-
-	// While sliding, the slide owns MaxWalkSpeed. Cancelling sprint here (from aim or fire)
-	// must change nothing about the slide in progress.
-	if (bSliding) return;
-
-	UCharacterMovementComponent* MoveComp = GetCharacterMovement();
-	if (!IsValid(MoveComp)) return;
-
-	MoveComp->MaxWalkSpeed = bSprinting ? SprintSpeed : WalkSpeed;
-}
-
-void AShooterCharacter::Server_SetSprinting_Implementation(bool bNewSprinting)
-{
-	Local_SetSprinting(bNewSprinting);
+	// Toggle, not hold. The movement component refuses to sprint while sliding or wall running,
+	// so this only flips intent - it no longer touches any movement parameter directly.
+	ShooterMovement->SetWantsToSprint(!ShooterMovement->WantsToSprint());
 }
 
 void AShooterCharacter::Input_Slide_Pressed()
 {
-	if (!CanStartSlide()) return;
+	if (!IsValid(ShooterMovement)) return;
 
-	Local_StartSlide();
-	Server_StartSlide();
-}
-
-bool AShooterCharacter::CanStartSlide() const
-{
-	if (bSliding) return false;
-
-	// A slide can only ever come out of a sprint.
-	if (!bSprinting) return false;
-
-	const UCharacterMovementComponent* MoveComp = GetCharacterMovement();
-	if (!IsValid(MoveComp) || MoveComp->IsFalling()) return false;
-
-	// Sprint can be toggled on while standing still, so the speed check is what actually
-	// prevents sliding from a standstill.
-	FVector GroundVelocity = GetVelocity();
-	GroundVelocity.Z = 0.f;
-	if (GroundVelocity.Size() < SlideMinStartSpeed) return false;
-
-	if (!IsValid(GetWorld())) return false;
-	if (GetWorld()->GetTimeSeconds() - LastSlideEndTime < SlideCooldown) return false;
-
-	return true;
-}
-
-void AShooterCharacter::Local_StartSlide()
-{
-	UCharacterMovementComponent* MoveComp = GetCharacterMovement();
-	if (!IsValid(MoveComp)) return;
-
-	// Entering a slide ends the sprint state, which is what unblocks firing and aiming
-	// during the slide. Order matters: set bSliding first so Local_SetSprinting leaves
-	// the movement params for the slide to own.
-	bSliding = true;
-	Local_SetSprinting(false);
-
-	CachedGroundFriction = MoveComp->GroundFriction;
-	CachedBrakingDeceleration = MoveComp->BrakingDecelerationWalking;
-	CachedMaxWalkSpeedCrouched = MoveComp->MaxWalkSpeedCrouched;
-
-	MoveComp->GroundFriction = SlideGroundFriction;
-	MoveComp->BrakingDecelerationWalking = SlideBrakingDeceleration;
-
-	// Raise the caps or the launch velocity is clamped straight back down.
-	MoveComp->MaxWalkSpeed = SlideLaunchSpeed;
-	MoveComp->MaxWalkSpeedCrouched = SlideLaunchSpeed;
-
-	FVector SlideDirection = GetVelocity();
-	SlideDirection.Z = 0.f;
-	if (SlideDirection.IsNearlyZero())
-	{
-		SlideDirection = GetActorForwardVector();
-	}
-	MoveComp->Velocity = SlideDirection.GetSafeNormal() * SlideLaunchSpeed;
-
-	Crouch();
-
-	if (IsValid(GetWorld()))
-	{
-		GetWorld()->GetTimerManager().SetTimer(SlideTimer, this, &ThisClass::StopSlide, SlideDuration, false);
-	}
-}
-
-void AShooterCharacter::Server_StartSlide_Implementation()
-{
-	// Re-validated on the server so a client cannot slide from a standstill or ignore the cooldown.
-	if (!CanStartSlide()) return;
-
-	Local_StartSlide();
-}
-
-void AShooterCharacter::StopSlide()
-{
-	if (!bSliding) return;
-
-	bSliding = false;
-
-	if (IsValid(GetWorld()))
-	{
-		GetWorld()->GetTimerManager().ClearTimer(SlideTimer);
-		LastSlideEndTime = GetWorld()->GetTimeSeconds();
-	}
-
-	UnCrouch();
-
-	UCharacterMovementComponent* MoveComp = GetCharacterMovement();
-	if (!IsValid(MoveComp)) return;
-
-	MoveComp->GroundFriction = CachedGroundFriction;
-	MoveComp->BrakingDecelerationWalking = CachedBrakingDeceleration;
-	MoveComp->MaxWalkSpeedCrouched = CachedMaxWalkSpeedCrouched;
-
-	// Exit state is walking: sprint was consumed by the slide, so re-sprinting is a
-	// deliberate second press. Combined with SlideCooldown this is the anti-spam guard.
-	MoveComp->MaxWalkSpeed = WalkSpeed;
+	// Latches intent. The movement component validates it inside the predicted update, which is
+	// also where the airborne landing buffer is honoured.
+	ShooterMovement->RequestSlide();
 }
 
 bool AShooterCharacter::IsSprinting_Implementation() const
 {
+	// Read live from the movement component, not from the replicated mirror, so a cancel is
+	// visible on the same frame. UCombatComponent cancels sprint and then fires within a single
+	// input event - a one frame lag here would drop the first shot.
+	if (IsValid(ShooterMovement) && (IsLocallyControlled() || HasAuthority()))
+	{
+		return ShooterMovement->IsSprinting();
+	}
+
+	// Simulated proxies never run the prediction, so they fall back to the replicated mirror.
 	return bSprinting;
 }
 
 bool AShooterCharacter::IsSliding_Implementation() const
 {
+	if (IsValid(ShooterMovement) && (IsLocallyControlled() || HasAuthority()))
+	{
+		return ShooterMovement->IsSliding();
+	}
 	return bSliding;
 }
 
-void AShooterCharacter::CancelSlide_Implementation()
+bool AShooterCharacter::IsWallRunning_Implementation() const
 {
-	if (!bSliding) return;
-
-	// Ends the slide early. StopSlide restores the movement params, uncrouches and starts
-	// the cooldown, so a cancelled slide cannot be chained straight into another one.
-	StopSlide();
-	Server_StopSlide();
-}
-
-void AShooterCharacter::Server_StopSlide_Implementation()
-{
-	StopSlide();
+	if (IsValid(ShooterMovement) && (IsLocallyControlled() || HasAuthority()))
+	{
+		return ShooterMovement->IsWallRunning();
+	}
+	return bWallRunning;
 }
 
 void AShooterCharacter::CancelSprint_Implementation()
 {
-	if (!bSprinting) return;
+	if (!IsValid(ShooterMovement)) return;
 
-	// Deliberately only touches the sprint state - never bSliding, never the jump.
-	Local_SetSprinting(false);
-	Server_SetSprinting(false);
+	// Deliberately only touches the sprint intent - never the slide, the wall run or the jump.
+	ShooterMovement->SetWantsToSprint(false);
+}
+
+void AShooterCharacter::CancelSlide_Implementation()
+{
+	if (!IsValid(ShooterMovement)) return;
+
+	// Ends an in-progress slide early by withdrawing the crouch the slide holds. Predicted,
+	// because it rides the base crouch flag rather than an RPC.
+	ShooterMovement->RequestCancelSlide();
+}
+
+bool AShooterCharacter::CanJumpInternal_Implementation() const
+{
+	// ACharacter::CanJumpInternal_Implementation opens with `!bIsCrouched`, and a slide holds a
+	// genuinely crouched capsule for its whole duration - so jumping out of a slide is refused
+	// before it ever reaches DoJump. Lift only the crouch condition here; the movement
+	// component's CanAttemptJump (which has its own slide carve-out) still has the final say,
+	// and the jump count rule is preserved so this can't hand out extra air jumps.
+	// bSliding is predicted state restored by FSavedMove_Shooter, so this replays correctly.
+	if (IsValid(ShooterMovement) && ShooterMovement->IsSliding())
+	{
+		return ShooterMovement->CanAttemptJump() && JumpCurrentCount < JumpMaxCount;
+	}
+
+	return Super::CanJumpInternal_Implementation();
+}
+
+void AShooterCharacter::OnJumped_Implementation()
+{
+	Super::OnJumped_Implementation();
+
+	// Runs inside CheckJumpInput on both the owning client and the server (including move replay),
+	// so overriding the launch here stays inside CharacterMovement's prediction. GetCurrentAcceleration
+	// is part of the saved move, so the redirect below replays identically on the server.
+	// The wall jump is handled in UShooterMovementComponent::DoJump and lands on JumpCurrentCount
+	// == 1, so it deliberately never reaches this redirect.
+	if (JumpCurrentCount > 1)
+	{
+		if (UCharacterMovementComponent* MoveComp = GetCharacterMovement(); IsValid(MoveComp))
+		{
+			MoveComp->Velocity.Z = DoubleJumpZVelocity;
+
+			// Directional air jump: rotate existing horizontal momentum onto the movement input
+			// direction. Without this the air jump only ever changes Z, so reversing direction
+			// mid-air has to fight the old momentum through air control alone - which is what
+			// reads as "floaty" / no control.
+			const FVector InputDirection = MoveComp->GetCurrentAcceleration().GetSafeNormal();
+			if (!InputDirection.IsNearlyZero())
+			{
+				FVector HorizontalVelocity = MoveComp->Velocity;
+				HorizontalVelocity.Z = 0.f;
+
+				// Speed is preserved through the turn (with a floor), so a mid-air reversal keeps
+				// pace instead of dumping the player's momentum.
+				const float RedirectSpeed = FMath::Max(HorizontalVelocity.Size(), DoubleJumpMinRedirectSpeed);
+
+				FVector Redirected = FMath::Lerp(
+					HorizontalVelocity,
+					InputDirection * RedirectSpeed,
+					FMath::Clamp(DoubleJumpRedirectAlpha, 0.f, 1.f));
+
+				Redirected += InputDirection * DoubleJumpDirectionalBoost;
+
+				MoveComp->Velocity.X = Redirected.X;
+				MoveComp->Velocity.Y = Redirected.Y;
+			}
+		}
+	}
+}
+
+void AShooterCharacter::UpdateCameraRoll(float DeltaTime)
+{
+	// Purely local feedback - the camera only exists on the owning client.
+	if (!IsLocallyControlled() || !IsValid(FirstPersonCamera)) return;
+
+	float TargetRoll = 0.f;
+	if (bWallRunning)
+	{
+		// Roll AWAY from the wall, so the view opens out from the surface rather than into it.
+		// Wall on the right -> negative roll. The sign lives here so WallRunCameraRoll stays a
+		// plain positive "degrees of tilt" value in the editor.
+		TargetRoll = (WallRunSide == EWallRunSide::Right) ? -WallRunCameraRoll : WallRunCameraRoll;
+	}
+
+	// Interped both ways, so the roll eases back to level when the run ends.
+	CurrentCameraRoll = FMath::FInterpTo(CurrentCameraRoll, TargetRoll, DeltaTime, WallRunCameraRollInterpSpeed);
+
+	// Relative to the SpringArm, which is the component driven by control rotation - so this
+	// adds roll without fighting the player's look input.
+	FRotator CameraRotation = FirstPersonCamera->GetRelativeRotation();
+	CameraRotation.Roll = CurrentCameraRoll;
+	FirstPersonCamera->SetRelativeRotation(CameraRotation);
 }
