@@ -36,7 +36,7 @@ private:
 	void OnCurrentReserveAmmoChanged(int32 RoundsInReserve, int32 RoundsInWeapon);
 	
 	UFUNCTION()
-	void OnRoundFired(int32 RoundsCurrent, int32 RoundsMax);
+	void OnRoundFired(int32 RoundsCurrent, int32 RoundsMax, int32 RoundsInReserve);
 	
 	UFUNCTION()
 	void OnWeaponFirstReplicated(AWeapon* Weapon);
