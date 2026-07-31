@@ -54,6 +54,14 @@ public:
 	/** Ends an in-progress slide early. No effect when not sliding. */
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
 	void CancelSlide();
+
+	/**
+	 * True while the character is attached to and running along a wall.
+	 * Read-only on purpose - there is no CancelWallRun(). Firing and aiming are gated on
+	 * IsSprinting() alone, so nothing outside the character should be ending a wall run.
+	 */
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
+	bool IsWallRunning() const;
 	
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
 	int32 GetReserveAmmo() const; 

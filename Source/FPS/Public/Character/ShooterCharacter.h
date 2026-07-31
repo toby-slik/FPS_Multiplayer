@@ -12,6 +12,7 @@ class UCombatComponent;
 class UCameraComponent;
 class USpringArmComponent;
 class UInputAction;
+class UShooterMovementComponent;
 class AWeapon;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FWeaponFirstReplicated, AWeapon*, Weapon);
@@ -21,9 +22,14 @@ class FPS_API AShooterCharacter : public ACharacter, public IPlayerInterface
 {
 	GENERATED_BODY()
 
+	// Owns the predicted sprint/slide/wall run simulation and reads its tuning straight off this
+	// class, so every FPS|Movement value stays where it already is on BP_ShooterCharacter.
+	friend class UShooterMovementComponent;
+	friend class FSavedMove_Shooter;
+
 public:
-	AShooterCharacter();
-	
+	AShooterCharacter(const FObjectInitializer& ObjectInitializer);
+
 	virtual void Tick(float DeltaTime) override;
 	virtual void SetupPlayerInputComponent(class UInputComponent* PlayerInputComponent) override;
 	virtual void PossessedBy(AController* NewController) override;
@@ -40,11 +46,21 @@ public:
 	virtual void CancelSprint_Implementation() override;
 	virtual bool IsSliding_Implementation() const override;
 	virtual void CancelSlide_Implementation() override;
+	virtual bool IsWallRunning_Implementation() const override;
 	virtual int32 GetReserveAmmo_Implementation() const override;
 	/** ~PlayerInterface */
-	
+
 	virtual void BeginPlay() override;
 	virtual void BeginDestroy() override;
+
+	/** Applies the directional air jump. The wall jump lives in UShooterMovementComponent::DoJump. */
+	virtual void OnJumped_Implementation() override;
+
+	/** Lifts the base "can't jump while crouched" rule for the slide case only. */
+	virtual bool CanJumpInternal_Implementation() const override;
+
+	UFUNCTION(BlueprintPure, Category = "FPS|Movement")
+	UShooterMovementComponent* GetShooterMovement() const { return ShooterMovement; }
 	
 	UFUNCTION(BlueprintCallable)
 	FRotator GetFixedRotation() const;
@@ -81,13 +97,26 @@ protected:
 	UPROPERTY(BlueprintReadOnly, Category = "FPS|TurnInPlace")
 	ETurnInPlace TurningStatus;
 
-	/** Drives the sprint state in ABP_FirstPerson / ABP_ThirdPerson. */
+	/**
+	 * Anim-facing mirrors of UShooterMovementComponent's predicted state, refreshed each Tick.
+	 * The movement component is the source of truth; these exist so ABP_FirstPerson /
+	 * ABP_ThirdPerson keep working unchanged, and so simulated proxies (which never run the
+	 * prediction) still have something to drive their state machines from.
+	 */
 	UPROPERTY(BlueprintReadOnly, Replicated, Category = "FPS|Movement")
 	bool bSprinting;
 
 	/** Drives the slide state in ABP_FirstPerson / ABP_ThirdPerson. Independent of bSprinting on purpose. */
 	UPROPERTY(BlueprintReadOnly, Replicated, Category = "FPS|Movement")
 	bool bSliding;
+
+	/** Drives the wall run state in ABP_FirstPerson / ABP_ThirdPerson. Independent of bSprinting. */
+	UPROPERTY(BlueprintReadOnly, Replicated, Category = "FPS|Movement")
+	bool bWallRunning;
+
+	/** Which side the wall is on. Anim BPs pick the left/right wall run pose from this. */
+	UPROPERTY(BlueprintReadOnly, Replicated, Category = "FPS|Movement")
+	EWallRunSide WallRunSide;
 
 	// --- Sprint tuning ---
 
@@ -128,6 +157,135 @@ protected:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
 	float SlideCooldown;
 
+	/**
+	 * How long a crouch press made while airborne stays queued. Land inside this window with the
+	 * normal slide conditions met and the slide fires immediately on touchdown. Set to 0 to disable.
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float SlideInputBufferTime;
+
+	// --- Jump tuning ---
+
+	/** Total jumps before touching the ground again. 2 = one ground jump plus one air jump. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	int32 MaxJumpCount;
+
+	/** Launch speed of the air jump. Kept separate from JumpZVelocity so the second jump can be tuned on its own. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float DoubleJumpZVelocity;
+
+	/**
+	 * How much of the existing horizontal momentum is rotated onto the movement input direction
+	 * when the air jump fires. 1 = fully committed to the new direction (snappy, lets you reverse
+	 * mid-air), 0 = momentum untouched (floaty). This is the main knob for directional control.
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float DoubleJumpRedirectAlpha;
+
+	/** Flat extra speed added along the input direction on the air jump, on top of the redirect. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float DoubleJumpDirectionalBoost;
+
+	/** Floor on the redirected speed, so an air jump from near-stationary still travels. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float DoubleJumpMinRedirectSpeed;
+
+	/**
+	 * Airborne steering authority. UE's stock 0.05 is almost none, which is what makes default
+	 * jumps feel locked-in.
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float DefaultAirControl;
+
+	// --- Wall run tuning ---
+
+	/** Minimum horizontal speed to attach to a wall, and the speed the run ends at once it decays below it. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallRunMinSpeed;
+
+	/** Speed the run accelerates toward while forward input is held. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallRunSpeed;
+
+	/** How quickly speed interps up to WallRunSpeed. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallRunAccelInterpSpeed;
+
+	/** Speed lost per second when forward input is released. This is what makes the speed-floor exit reachable. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallRunDeceleration;
+
+	/** GravityScale while attached. Low but non-zero so the run visibly sinks. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallRunGravityScale;
+
+	/** Downward speed is clamped to this while attached, so long runs don't build fall speed. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallRunMaxFallSpeed;
+
+	/**
+	 * UNUSED since the wall run became a real movement mode - PhysWallRun writes velocity
+	 * directly, so there is no air control stage to scale. Kept so the value on
+	 * BP_ShooterCharacter isn't lost; safe to delete once you're happy with the feel.
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallRunAirControl;
+
+	/** Hard time limit on a single wall run. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallRunMaxDuration;
+
+	/** Sideways trace length from the capsule centre when looking for a wall. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallRunTraceDistance;
+
+	/** A surface only counts as a wall if |ImpactNormal.Z| is below this. Keeps ramps and ceilings out. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallRunMaxWallNormalZ;
+
+	/** Required clearance below the capsule to attach, so you can't wall run while grazing the floor. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallRunMinGroundClearance;
+
+	/** Can't attach while still rising faster than this - stops instant attach on the way up. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallRunMaxStartVerticalSpeed;
+
+	/** Movement input must point this much along the character's forward vector to attach. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallRunMinForwardInputDot;
+
+	/** Constant velocity pushed into the wall each tick to keep the capsule glued to it. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallRunStickSpeed;
+
+	/** Dominant component of the wall jump: along the player's direction of travel. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallJumpForwardSpeed;
+
+	/** Smaller outward (along the wall normal) component, just enough to clear the surface. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallJumpOutwardSpeed;
+
+	/** Upward component of the wall jump. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallJumpUpwardSpeed;
+
+	/** Minimum time before attaching to any wall again. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallRunCooldown;
+
+	/** Longer guard against re-attaching to the wall just left. Stops climbing one wall forever. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallRunSameWallCooldown;
+
+	/** Camera roll while attached, in degrees. Negate if the tilt feels inverted. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallRunCameraRoll;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Movement")
+	float WallRunCameraRollInterpSpeed;
+
 private:
 
 	void Input_CycleWeapon();
@@ -139,28 +297,15 @@ private:
 	void Input_Sprint_Toggle();
 	void Input_Slide_Pressed();
 
-	void Local_SetSprinting(bool bNewSprinting);
-
-	UFUNCTION(Server, Reliable)
-	void Server_SetSprinting(bool bNewSprinting);
-
-	void Local_StartSlide();
-
-	UFUNCTION(Server, Reliable)
-	void Server_StartSlide();
-
-	UFUNCTION(Server, Reliable)
-	void Server_StopSlide();
-
-	void StopSlide();
-	bool CanStartSlide() const;
+	/** Copies the movement component's predicted state onto the replicated anim mirrors. */
 	void UpdateMovementState();
 
-	FTimerHandle SlideTimer;
-	float LastSlideEndTime;
-	float CachedGroundFriction;
-	float CachedBrakingDeceleration;
-	float CachedMaxWalkSpeedCrouched;
+	void UpdateCameraRoll(float DeltaTime);
+	float CurrentCameraRoll;
+
+	/** Cached from GetCharacterMovement(); the class is swapped in via the FObjectInitializer. */
+	UPROPERTY()
+	TObjectPtr<UShooterMovementComponent> ShooterMovement;
 
 	void CalculateFABRIKSocketTransform();
 	void CalculateTurnInPlaceParameters(float DeltaTime);
