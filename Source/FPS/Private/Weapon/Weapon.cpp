@@ -39,12 +39,7 @@ AWeapon::AWeapon()
 	Ammo = 30;
 	StartingCarriedAmmo = 10;
 	Sequence = 0;
-}
-
-void AWeapon::OnRep_Instigator()
-{
-	Super::OnRep_Instigator();
-	AttachToOwningPawn();
+	WeaponStatus = EWeaponStatus::Unequipped;
 }
 
 USkeletalMeshComponent* AWeapon::GetMesh1P() const
@@ -75,19 +70,27 @@ UMaterialInstanceDynamic* AWeapon::GetAmmoCounterDynamicMaterialInstance()
 	return DynMatInst_AmmoCounter;
 }
 
-void AWeapon::AttachToOwningPawn() const
+void AWeapon::AttachToOwningPawn(APawn* Pawn) const
 {
-	APawn* OwningPawn = GetInstigator();
-	if (!IsValid(OwningPawn) || !OwningPawn->Implements<UPlayerInterface>()) return;
+	if (!IsValid(Pawn) || !Pawn->Implements<UPlayerInterface>()) return;
 	
-	SetMeshVisibilities(OwningPawn);
+	SetMeshVisibilities(Pawn);
 	
-	const FName AttachPoint = IPlayerInterface::Execute_GetWeaponAttachPoint(OwningPawn, WeaponType);
-	USkeletalMeshComponent* PawnMesh1P = IPlayerInterface::Execute_GetMesh1P(OwningPawn);
-	USkeletalMeshComponent* PawnMesh3P = IPlayerInterface::Execute_GetMesh3P(OwningPawn);
+	const FName AttachPoint = IPlayerInterface::Execute_GetWeaponAttachPoint(Pawn, WeaponType);
+	USkeletalMeshComponent* PawnMesh1P = IPlayerInterface::Execute_GetMesh1P(Pawn);
+	USkeletalMeshComponent* PawnMesh3P = IPlayerInterface::Execute_GetMesh3P(Pawn);
 	
 	Mesh1P->AttachToComponent(PawnMesh1P, FAttachmentTransformRules::KeepRelativeTransform, AttachPoint);
 	Mesh3P->AttachToComponent(PawnMesh3P, FAttachmentTransformRules::KeepRelativeTransform, AttachPoint);
+}
+
+void AWeapon::DetachFromOwningPawn()
+{
+	Mesh1P->DetachFromComponent(FDetachmentTransformRules::KeepRelativeTransform);
+	Mesh1P->SetHiddenInGame(true);
+	
+	Mesh3P->DetachFromComponent(FDetachmentTransformRules::KeepRelativeTransform);
+	Mesh3P->SetHiddenInGame(true);
 }
 
 void AWeapon::WeaponTrace(FHitResult& OutHit, float TraceLength)

@@ -64,5 +64,9 @@ public:
 	bool IsWallRunning() const;
 	
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
-	int32 GetReserveAmmo() const; 
+	int32 GetReserveAmmo() const;
+	
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
+	void Notify_CycleWeapon();
+
 };

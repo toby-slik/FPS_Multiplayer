@@ -19,6 +19,15 @@ enum class EFireType : uint8
 	SemiAuto UMETA(DisplayName = "SemiAutomatic")
 };
 
+UENUM(BlueprintType)
+enum class EWeaponStatus : uint8
+{
+	Idle, // weapon doing nothing can fire/ roload / cycle
+	Firing, 
+	Reloading,
+	Cycling,
+	Unequipped,
+};
 
 UCLASS()
 class FPS_API AWeapon : public AActor
@@ -27,14 +36,14 @@ class FPS_API AWeapon : public AActor
 
 public:
 	AWeapon();
-	virtual void OnRep_Instigator() override;
 	
 	USkeletalMeshComponent* GetMesh1P() const;
 	USkeletalMeshComponent* GetMesh3P() const;
 	UMaterialInstanceDynamic* GetReticleDynamicMaterialInstance();
 	UMaterialInstanceDynamic* GetAmmoCounterDynamicMaterialInstance();
 	
-	void AttachToOwningPawn() const;
+	void AttachToOwningPawn(APawn* Pawn) const;
+	void DetachFromOwningPawn();
 	void WeaponTrace(FHitResult& OutHit, float TraceLength);
 	
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "FPS|WeaponType")
@@ -48,12 +57,15 @@ public:
 	
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "FPS|FireType")
 	EFireType FireType;
-	
+	 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "FPS|FireType")
 	float FireTime;
 	
 	UPROPERTY(EditDefaultsOnly, Category= "FPS|Reticle")
 	FReticleParams ReticleParams;
+	
+	UPROPERTY(EditDefaultsOnly, Category= "FPS|Icon")
+	TObjectPtr<UMaterialInterface> WeaponIcon;
 	
 	void Local_Fire(const FVector& ImpactPoint, const FVector& ImpactNormal, TEnumAsByte<EPhysicalSurface> ImpactSurfaceType, bool bIsFirstPerson);
 	void Auth_Fire();
@@ -67,6 +79,8 @@ public:
 	
 	UPROPERTY(EditAnywhere, Category="FPS|Ammo")
 	int32 StartingCarriedAmmo;
+	
+	EWeaponStatus WeaponStatus;
 	
 protected:
 	virtual void BeginPlay() override;

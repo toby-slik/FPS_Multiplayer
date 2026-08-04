@@ -48,6 +48,7 @@ public:
 	virtual void CancelSlide_Implementation() override;
 	virtual bool IsWallRunning_Implementation() const override;
 	virtual int32 GetReserveAmmo_Implementation() const override;
+	virtual void Notify_CycleWeapon_Implementation() override;
 	/** ~PlayerInterface */
 
 	virtual void BeginPlay() override;

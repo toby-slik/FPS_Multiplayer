@@ -18,7 +18,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAmmoCounterChanged, UMaterialIns
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FRoundFired, int32, RoundsCurrent, int32, RoundsMax, int32, RoundsInReserve);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAimingStatusChanged, bool, bIsAiming);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FTargetingPlayerStatusChanged, bool, bIsAiming);
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FCurrentReserveAmmoChanged, int32, RoundsInReserve, int32, RoundsInWeapon);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FCurrentReserveAmmoChanged, int32, RoundsInReserve, int32, RoundsInWeapon, UMaterialInterface*, WeaponIconMaterial);
 
 UCLASS(ClassGroup=(Custom), meta=(BlueprintSpawnableComponent))
 class FPS_API UCombatComponent : public UActorComponent
@@ -40,6 +40,8 @@ public:
 	void Initiate_ReloadWeapon();
 	void Initiate_Aim_Pressed();
 	void Initiate_Aim_Released();
+	
+	void Notify_CycleWeapon();
 	
 	UPROPERTY(BlueprintAssignable)
 	FReticleChanged OnReticleChanged;
@@ -63,6 +65,11 @@ public:
 	TObjectPtr<UWeaponData> WeaponData;
 	
 	void Equip(AWeapon* Weapon);
+	void EquipWeapon(AWeapon* Weapon);
+	
+	UFUNCTION(Server, Reliable)
+	void Server_EquipWeapon(AWeapon* Weapon);
+	
 	void SpawnInventory();
 	void DestroyInventory();
 	
@@ -83,6 +90,9 @@ protected:
 	UPROPERTY(EditDefaultsOnly, Category = "FPS|Weapon")
 	float TraceLength;
 	
+	UFUNCTION()
+	void BlendOut_CycleWeapon(UAnimMontage* Montage, bool bInterrupted);
+	
 private:
 	
 	TMap<FGameplayTag, int32> ReserveAmmo;
@@ -94,6 +104,8 @@ private:
 	
 	UFUNCTION()
 	void OnRep_CurrentWeapon(AWeapon* LastWeapon);
+	
+	void SetCurrentWeapon(AWeapon* NewWeapon, AWeapon* LastWeapon);
 	
 	UPROPERTY(Transient, Replicated)
 	TArray<AWeapon*> Inventory;
@@ -114,6 +126,17 @@ private:
 	
 	void Local_Aim(bool bPressed);
 	void Local_FireWeapon();
+	
+	int32 Local_WeaponIndex;
+	int32 AdvanceWeaponIndex();
+	
+	void Local_CycleWeapon(int32 WeaponIndex);
+	
+	UFUNCTION(Server, Reliable)
+	void ServerCycleWeapon(int32 WeaponIndex);
+	
+	UFUNCTION(NetMulticast, Reliable)
+	void Multicast_CycleWeapon(int32 WeaponIndex);
 	
 	UFUNCTION()
 	void OnRep_CurrentReserveAmmo();
