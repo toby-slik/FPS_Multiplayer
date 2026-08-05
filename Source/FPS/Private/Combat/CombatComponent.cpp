@@ -262,10 +262,17 @@ void UCombatComponent::Initiate_FireWeapon_Pressed()
 
 	bTriggerPressed = true;
 
-	if (CurrentWeapon->WeaponStatus == EWeaponStatus::Idle && CurrentWeapon->Ammo > 0)
+	if (CurrentWeapon->WeaponStatus != EWeaponStatus::Idle) return;
+
+	// A dry click starts the reload rather than doing nothing. Initiate_ReloadWeapon still decides
+	// whether there is anything to reload with, so an empty reserve is a no-op as before.
+	if (CurrentWeapon->Ammo <= 0)
 	{
-		Local_FireWeapon();
+		Initiate_ReloadWeapon();
+		return;
 	}
+
+	Local_FireWeapon();
 }
 
 void UCombatComponent::Local_FireWeapon()

@@ -6,7 +6,9 @@
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
 #include "EnhancedInputSubsystems.h"
+#include "Combat/CombatComponent.h"
 #include "Engine/LocalPlayer.h"
+#include "Weapon/Weapon.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Interfaces/PlayerInterface.h"
@@ -130,6 +132,15 @@ void AShooterPlayerController::Input_Look(const FInputActionValue& InputActionVa
 	if (!bPawnAlive) return;
 	
 	const FVector2D InputAxisVector = InputActionValue.Get<FVector2D>();
-	AddYawInput(InputAxisVector.X);
-	AddPitchInput(InputAxisVector.Y);
+
+	// On top of the FOV Scaling modifier on IA_Look, which already slows turning by however far the
+	// weapon pulls the FOV in. This is the per-weapon trim on that.
+	float LookScale = 1.f;
+	if (const UCombatComponent* Combat = UCombatComponent::FindCombatComponent(GetPawn()); IsValid(Combat) && Combat->bAiming && IsValid(Combat->CurrentWeapon))
+	{
+		LookScale = Combat->CurrentWeapon->AimLookSensitivityScale;
+	}
+
+	AddYawInput(InputAxisVector.X * LookScale);
+	AddPitchInput(InputAxisVector.Y * LookScale);
 }

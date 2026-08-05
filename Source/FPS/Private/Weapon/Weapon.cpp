@@ -33,6 +33,7 @@ AWeapon::AWeapon()
 	Mesh3P->SetHiddenInGame(true);
 
 	AimFieldOfView = 65.0f;
+	AimLookSensitivityScale = 1.0f;
 	TraceRadius = 5.f;
 	FireTime = 0.1f;
 	MagCapacity = 10;

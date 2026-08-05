@@ -51,6 +51,14 @@ public:
 	
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Aiming")
 	float AimFieldOfView;
+
+	/**
+	 * Look sensitivity multiplier applied while aiming this weapon. 1.0 keeps whatever the FOV Scaling
+	 * modifier on IA_Look already gives (aiming narrows the FOV, so turning is roughly
+	 * AimFieldOfView / DefaultFOV as slow); below 1.0 slows aimed turning further.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "FPS|Aiming")
+	float AimLookSensitivityScale;
 	
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Trace")
 	float TraceRadius;
