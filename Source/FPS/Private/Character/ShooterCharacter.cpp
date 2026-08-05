@@ -14,6 +14,7 @@
 #include "Engine/World.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/SpringArmComponent.h"
+#include "Health/HealthComponent.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "Net/UnrealNetwork.h"
 #include "Weapon/Weapon.h"
@@ -56,6 +57,9 @@ AShooterCharacter::AShooterCharacter(const FObjectInitializer& ObjectInitializer
 	
 	Combat = CreateDefaultSubobject<UCombatComponent>("Combat");
 	Combat->SetIsReplicated(true);
+	
+	Health = CreateDefaultSubobject<UHealthComponent>("Health");
+	Health->SetIsReplicated(true);
 	
 	DefaultFOV = 90.0f;
 	TurningStatus = ETurnInPlace::NotTurning;
@@ -373,7 +377,9 @@ void AShooterCharacter::Notify_ReloadWeapon_Implementation()
 
 bool AShooterCharacter::DoDamage_Implementation(float DamageAmount, AActor* DamageInstigator)
 {
-	// Change health by damage amount
+	if (!IsValid(Health)) return false;
+	
+	Health->ChangeHealthByAmount(-DamageAmount, DamageInstigator);
 	
 	const int32 MontageSelection = FMath::RandRange(0, HitReacts.Num() - 1);
 	Multicast_HitReact(MontageSelection);
