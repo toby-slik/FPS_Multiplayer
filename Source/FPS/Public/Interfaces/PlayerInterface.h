@@ -68,5 +68,11 @@ public:
 	
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
 	void Notify_CycleWeapon();
+	
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
+	void Notify_ReloadWeapon();
+	
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
+	bool DoDamage(float DamageAmount, AActor* DamageInstigator);
 
 };

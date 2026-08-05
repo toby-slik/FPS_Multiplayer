@@ -17,6 +17,7 @@
 #include "Kismet/KismetMathLibrary.h"
 #include "Net/UnrealNetwork.h"
 #include "Weapon/Weapon.h"
+#include "Animation/AnimInstance.h"
 
 AShooterCharacter::AShooterCharacter(const FObjectInitializer& ObjectInitializer)
 	// Swaps the stock CharacterMovementComponent for the predicted one. Same subobject name, so
@@ -363,6 +364,32 @@ void AShooterCharacter::Notify_CycleWeapon_Implementation()
 void AShooterCharacter::Input_CycleWeapon()
 {
 	Combat->Initiate_CycleWeapon();
+}
+
+void AShooterCharacter::Notify_ReloadWeapon_Implementation()
+{
+	Combat->Notify_ReloadWeapon();
+}
+
+bool AShooterCharacter::DoDamage_Implementation(float DamageAmount, AActor* DamageInstigator)
+{
+	// Change health by damage amount
+	
+	const int32 MontageSelection = FMath::RandRange(0, HitReacts.Num() - 1);
+	Multicast_HitReact(MontageSelection);
+	
+	return false;
+}
+
+void AShooterCharacter::Multicast_HitReact_Implementation(int32 MontageIndex)
+{
+	if (GetNetMode() != NM_DedicatedServer && !IsLocallyControlled())
+	{
+		if (HitReacts.IsValidIndex(MontageIndex))
+		{
+			GetMesh()->GetAnimInstance()->Montage_Play(HitReacts[MontageIndex]);
+		}
+	}
 }
 
 void AShooterCharacter::Input_ReloadWeapon()

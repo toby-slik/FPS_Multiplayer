@@ -42,6 +42,7 @@ public:
 	void Initiate_Aim_Released();
 	
 	void Notify_CycleWeapon();
+	void Notify_ReloadWeapon();
 	
 	UPROPERTY(BlueprintAssignable)
 	FReticleChanged OnReticleChanged;
@@ -140,10 +141,23 @@ private:
 	
 	UFUNCTION()
 	void OnRep_CurrentReserveAmmo();
+	
+	void Local_ReloadWeapon();
+	
+	UFUNCTION(Server, Reliable)
+	void Server_ReloadWeapon();
+	
+	UFUNCTION(Client, Reliable)
+	void Client_ReloadWeapon(int32 NewWeaponAmmo, int32 NewCarriedAmmo);
+	
+	UFUNCTION(NetMulticast, Reliable)
+	void Multicast_ReloadWeapon();
 
 	/** Sprint state of the owning pawn, asked through IPlayerInterface. */
 	bool IsOwnerSprinting() const;
 
 	/** Ends the owning pawn's sprint. Never affects sliding, jumping or any other movement state. */
 	void CancelOwnerSprint();
+	
+	
 };
