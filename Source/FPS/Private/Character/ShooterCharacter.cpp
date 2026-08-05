@@ -11,6 +11,7 @@
 #include "Components/SkeletalMeshComponent.h"
 #include "Data/WeaponData.h"
 #include "CollisionQueryParams.h"
+#include "ShooterGameModeBase.h"
 #include "Engine/World.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/SpringArmComponent.h"
@@ -19,6 +20,10 @@
 #include "Net/UnrealNetwork.h"
 #include "Weapon/Weapon.h"
 #include "Animation/AnimInstance.h"
+#include "Components/CapsuleComponent.h"
+#include "FPS/FPS.h"
+#include "Kismet/GameplayStatics.h"
+#include "Player/ShooterPlayerController.h"
 
 AShooterCharacter::AShooterCharacter(const FObjectInitializer& ObjectInitializer)
 	// Swaps the stock CharacterMovementComponent for the predicted one. Same subobject name, so
@@ -64,6 +69,7 @@ AShooterCharacter::AShooterCharacter(const FObjectInitializer& ObjectInitializer
 	DefaultFOV = 90.0f;
 	TurningStatus = ETurnInPlace::NotTurning;
 	bWeaponFirstReplicated = false;
+	RespawnTime = 3.f;
 
 	bSprinting = false;
 	bSliding = false;
@@ -134,9 +140,16 @@ void AShooterCharacter::BeginPlay()
 {
 	Super::BeginPlay();
 	
+	Health->OnDeathStarted.AddDynamic(this, &ThisClass::OnDeathStarted);
+	
 	FirstPersonCamera->SetFieldOfView(DefaultFOV);
 
 	StartingAimRotation = FRotator(0.f, GetBaseAimRotation().Yaw, 0.f);
+	
+	if (AShooterPlayerController* PC = Cast<AShooterPlayerController>(GetController()); IsValid(PC))
+	{
+		PC->bPawnAlive = true;
+	}
 
 	// Cached again here because a Blueprint-constructed instance builds its components after the
 	// C++ constructor has run.
@@ -363,6 +376,39 @@ int32 AShooterCharacter::GetReserveAmmo_Implementation() const
 void AShooterCharacter::Notify_CycleWeapon_Implementation()
 {
 	Combat->Notify_CycleWeapon();
+}
+
+void AShooterCharacter::OnDeathStarted()
+{
+	if (HasAuthority())
+	{
+		Combat->DestroyInventory();
+		GetWorld()->GetTimerManager().SetTimer(DeathTimer, this, &ThisClass::DeathTimerFinished, RespawnTime);
+	}
+	if (GetNetMode() != NM_DedicatedServer)
+	{
+		DeathEffects();
+		if (AShooterPlayerController* PC = Cast<AShooterPlayerController>(GetController()); IsValid(PC))
+		{
+			DisableInput(PC);
+			if (PC->IsLocalController())
+			{
+				PC->bPawnAlive = false;
+			}
+		}
+	}
+	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Pawn, ECR_Ignore);
+	GetCapsuleComponent()->SetCollisionResponseToChannel(FPSTraceChannels::ECC_Weapon, ECR_Ignore);
+	GetMesh()->SetCollisionResponseToChannel(FPSTraceChannels::ECC_Weapon, ECR_Ignore);
+}
+
+void AShooterCharacter::DeathTimerFinished()
+{
+	AShooterGameModeBase* GM = Cast<AShooterGameModeBase>(UGameplayStatics::GetGameMode(this));
+	if (IsValid(GM))
+	{
+		GM->RequestRespawn(this, GetController());
+	}
 }
 
 void AShooterCharacter::Input_CycleWeapon()

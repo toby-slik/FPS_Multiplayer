@@ -83,7 +83,13 @@ public:
 	UPROPERTY(EditDefaultsOnly, Category = "FPS|HitReact")
 	TArray<TObjectPtr<UAnimMontage>> HitReacts;
 	
+	UPROPERTY(EditDefaultsOnly, Category = "FPS|Respawn")
+	float RespawnTime;
+	
 protected:
+	
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "FPS|Mesh")
+	TObjectPtr<USkeletalMeshComponent> Mesh1P;
 	
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "FPS|Health")
 	TObjectPtr<UHealthComponent> Health;
@@ -300,6 +306,12 @@ protected:
 	
 	UFUNCTION(NetMulticast, Reliable)
 	void Multicast_HitReact(int32 MontageIndex);
+	
+	UFUNCTION()
+	void OnDeathStarted();
+	
+	UFUNCTION(BlueprintImplementableEvent)
+	void DeathEffects();
 
 private:
 
@@ -329,10 +341,11 @@ private:
 	bool bWeaponFirstReplicated;
 	FRotator StartingAimRotation;
 	float InterpAO_Yaw;
+	FTimerHandle DeathTimer;
 	
-	// 1st person view (arms)
-	UPROPERTY(VisibleAnywhere)
-	TObjectPtr<USkeletalMeshComponent> Mesh1P;
+	void DeathTimerFinished();
+	
+
 	
 	UPROPERTY(VisibleAnywhere)
 	TObjectPtr<USpringArmComponent> SpringArm;

@@ -14,6 +14,7 @@
 AShooterPlayerController::AShooterPlayerController()
 {
 	bReplicates = true;
+	bPawnAlive = true;
 }
 
 void AShooterPlayerController::BeginPlay()
@@ -51,7 +52,8 @@ void AShooterPlayerController::Input_Crouch()
 {
 	ACharacter* ControlledCharacter = GetCharacter();
 	if (!IsValid(ControlledCharacter)) return;
-
+	if (!bPawnAlive) return;
+	
 	// Slide shares this key with crouch. A second press during a slide cancels it rather than
 	// toggling crouch underneath it. The cancel withdraws the crouch the slide holds, so the
 	// player ends up standing - and because it rides the base crouch flag, it stays predicted.
@@ -72,6 +74,7 @@ void AShooterPlayerController::Input_Jump()
 {
 	ACharacter* ControlledCharacter = GetCharacter();
 	if (!IsValid(ControlledCharacter)) return;
+	if (!bPawnAlive) return;
 	UCharacterMovementComponent* CMC = ControlledCharacter->GetCharacterMovement();
 	if (!IsValid(CMC)) return;
 
@@ -105,6 +108,8 @@ void AShooterPlayerController::Input_Jump()
 
 void AShooterPlayerController::Input_Move(const FInputActionValue& InputActionValue)
 {
+	if (!bPawnAlive) return;
+	
 	const FVector2D InputAxisVector = InputActionValue.Get<FVector2D>();
 	const FRotator Rotation = GetControlRotation();
 	const FRotator YawRotaton(0.f, Rotation.Yaw, 0.f);
@@ -122,6 +127,8 @@ void AShooterPlayerController::Input_Move(const FInputActionValue& InputActionVa
 
 void AShooterPlayerController::Input_Look(const FInputActionValue& InputActionValue)
 {
+	if (!bPawnAlive) return;
+	
 	const FVector2D InputAxisVector = InputActionValue.Get<FVector2D>();
 	AddYawInput(InputAxisVector.X);
 	AddPitchInput(InputAxisVector.Y);

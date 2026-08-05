@@ -20,6 +20,8 @@ class FPS_API AShooterPlayerController : public APlayerController
 public:
 	AShooterPlayerController();
 	
+	bool bPawnAlive;
+	
 	
 protected:
 	virtual void BeginPlay() override;
