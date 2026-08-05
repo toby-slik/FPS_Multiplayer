@@ -93,7 +93,7 @@ protected:
 	
 	UFUNCTION()
 	void BlendOut_CycleWeapon(UAnimMontage* Montage, bool bInterrupted);
-	
+
 private:
 	
 	TMap<FGameplayTag, int32> ReserveAmmo;
@@ -143,15 +143,22 @@ private:
 	void OnRep_CurrentReserveAmmo();
 	
 	void Local_ReloadWeapon();
-	
+
 	UFUNCTION(Server, Reliable)
 	void Server_ReloadWeapon();
-	
+
 	UFUNCTION(Client, Reliable)
 	void Client_ReloadWeapon(int32 NewWeaponAmmo, int32 NewCarriedAmmo);
-	
+
 	UFUNCTION(NetMulticast, Reliable)
 	void Multicast_ReloadWeapon();
+
+	/** Moves rounds from reserve into the mag on the authority and confirms the result to the owner. */
+	void Auth_ReloadWeapon();
+
+	/** Sent by the owning client when its reload animation reaches the point the mag goes in. */
+	UFUNCTION(Server, Reliable)
+	void Server_CompleteReload();
 
 	/** Sprint state of the owning pawn, asked through IPlayerInterface. */
 	bool IsOwnerSprinting() const;

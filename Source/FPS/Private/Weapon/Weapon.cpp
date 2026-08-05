@@ -156,9 +156,11 @@ void AWeapon::Rep_Fire(int32 AuthAmmo)
 {
 	if (GetInstigator()->IsLocallyControlled())
 	{
-		Ammo = AuthAmmo; 
-		--Sequence;
-		Ammo -= Sequence;
+		// This shot is now acknowledged, so only the still-unacknowledged ones stay predicted away.
+		// Clamped because a stale Sequence would otherwise hand back a negative mag (locks out firing)
+		// or one above capacity.
+		Sequence = FMath::Max(Sequence - 1, 0);
+		Ammo = FMath::Clamp(AuthAmmo - Sequence, 0, MagCapacity);
 	}
 }
 

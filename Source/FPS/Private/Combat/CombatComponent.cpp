@@ -106,35 +106,68 @@ void UCombatComponent::Notify_CycleWeapon()
 
 void UCombatComponent::Notify_ReloadWeapon()
 {
-	if (!IsValid(CurrentWeapon)) return;
-	if (GetNetMode() == NM_ListenServer || GetNetMode() == NM_DedicatedServer || GetNetMode() == NM_Standalone)
-	{
-		const int32 EmptySpace = CurrentWeapon->MagCapacity - CurrentWeapon->Ammo;
-		const int32 AmountToRefill = FMath::Min(EmptySpace, CurrentReserveAmmo);
-		CurrentWeapon->Ammo += AmountToRefill;
-		ReserveAmmo[CurrentWeapon->WeaponType] = ReserveAmmo[CurrentWeapon->WeaponType] - AmountToRefill;
-		CurrentReserveAmmo = ReserveAmmo[CurrentWeapon->WeaponType];
-		Client_ReloadWeapon(CurrentWeapon->Ammo, CurrentReserveAmmo);
-	}
+	APawn* OwningPawn = Cast<APawn>(GetOwner());
+	if (!IsValid(CurrentWeapon) || !IsValid(OwningPawn)) return;
+
 	CurrentWeapon->WeaponStatus = EWeaponStatus::Idle;
-	if (bTriggerPressed && CurrentWeapon->Ammo > 0)
+
+	// Only the machine that owns the pawn drives reload completion. The server's own copy of the montage
+	// plays on the 3P mesh, where a hit react or a fire montage can stomp it before the notify lands -
+	// deciding the refill from there means the reload is silently dropped and the mag stays empty.
+	if (!OwningPawn->IsLocallyControlled()) return;
+
+	if (OwningPawn->HasAuthority())
 	{
-		Local_FireWeapon();
+		Auth_ReloadWeapon();
 	}
+	else
+	{
+		Server_CompleteReload();
+	}
+}
+
+void UCombatComponent::Auth_ReloadWeapon()
+{
+	if (!IsValid(CurrentWeapon)) return;
+
+	const int32 EmptySpace = CurrentWeapon->MagCapacity - CurrentWeapon->Ammo;
+	const int32 AmountToRefill = FMath::Min(EmptySpace, CurrentReserveAmmo);
+
+	CurrentWeapon->Ammo += AmountToRefill;
+	CurrentWeapon->WeaponStatus = EWeaponStatus::Idle;
+
+	ReserveAmmo[CurrentWeapon->WeaponType] -= AmountToRefill;
+	CurrentReserveAmmo = ReserveAmmo[CurrentWeapon->WeaponType];
+
+	Client_ReloadWeapon(CurrentWeapon->Ammo, CurrentReserveAmmo);
+}
+
+void UCombatComponent::Server_CompleteReload_Implementation()
+{
+	Auth_ReloadWeapon();
 }
 
 void UCombatComponent::Client_ReloadWeapon_Implementation(int32 NewWeaponAmmo, int32 NewCarriedAmmo)
 {
 	APawn* OwningPawn = Cast<APawn>(GetOwner());
 	if (!IsValid(CurrentWeapon) || !IsValid(OwningPawn)) return;
-	
+
 	if (OwningPawn->IsLocallyControlled())
 	{
+		// Ammo is being set outright rather than reconciled per shot, so any predicted shots still on
+		// the books have to go with it - leaving them would subtract from every future mag.
+		CurrentWeapon->ResetPredictionSequence();
 		CurrentWeapon->Ammo = NewWeaponAmmo;
 		CurrentReserveAmmo = NewCarriedAmmo;
-		
+
 		OnAmmoCounterChanged.Broadcast(CurrentWeapon->GetAmmoCounterDynamicMaterialInstance(), CurrentWeapon->Ammo, CurrentWeapon->MagCapacity);
 		OnCurrentReserveAmmoChanged.Broadcast(CurrentReserveAmmo, CurrentWeapon->Ammo, CurrentWeapon->WeaponIcon);
+
+		// The rounds only exist locally now, so a held trigger is picked back up here rather than at the notify.
+		if (bTriggerPressed && CurrentWeapon->Ammo > 0)
+		{
+			Local_FireWeapon();
+		}
 	}
 }
 
@@ -294,28 +327,29 @@ void UCombatComponent::FireTimerFinished()
 	{
 		CurrentWeapon->WeaponStatus = EWeaponStatus::Idle;
 	}
-	
+
+	// Status has to gate the loop as well as the initial press. Without this, a held trigger fires
+	// straight through a reload or a weapon cycle, and the fire montage stomps the reload montage
+	// before its notify can land - so the reload never completes and the mag is never refilled.
+	if (CurrentWeapon->WeaponStatus != EWeaponStatus::Idle) return;
+
 	if (bTriggerPressed && CurrentWeapon->FireType == EFireType::Auto && CurrentWeapon->Ammo > 0)
 	{
 		Local_FireWeapon();
-		
 	}
 }
 
 void UCombatComponent::Server_FireWeapon_Implementation(const FHitResult& Hit)
 {
 	if (!IsValid(CurrentWeapon)) return;
+
+	APawn* OwningPawn = Cast<APawn>(GetOwner());
+	if (!IsValid(OwningPawn)) return;
 	if (CurrentWeapon->Ammo <= 0) return;
-	
+
 	if (IsValid(Hit.GetActor()) && Hit.GetActor()->Implements<UPlayerInterface>())
 	{
 		IPlayerInterface::Execute_DoDamage(Hit.GetActor(), CurrentWeapon->Damage, GetOwner());
-	}
-
-	APawn* OwningPawn = Cast<APawn>(GetOwner());
-	if (!IsValid(OwningPawn))
-	{
-		return;
 	}
 
 	// A locally controlled authority pawn already spent its round in Local_Fire.
@@ -382,7 +416,7 @@ void UCombatComponent::Local_ReloadWeapon()
 	{
 		Mesh->GetAnimInstance()->Montage_Play(ReloadMontage);
 	}
-	
+
 	UAnimMontage* WeaponReloadMontage = WeaponData->WeaponMontages.FindChecked(CurrentWeapon->WeaponType).ReloadMontage;
 	USkeletalMeshComponent* WeaponMesh = bIsLocal ? CurrentWeapon->GetMesh1P() : CurrentWeapon->GetMesh3P();
 	if (IsValid(WeaponReloadMontage) && IsValid(WeaponMesh))
@@ -405,6 +439,13 @@ void UCombatComponent::Server_ReloadWeapon_Implementation()
 
 void UCombatComponent::Multicast_ReloadWeapon_Implementation()
 {
+	APawn* OwningPawn = Cast<APawn>(GetOwner());
+	if (!IsValid(OwningPawn)) return;
+
+	// The instigator already played its own reload in Initiate_ReloadWeapon. Playing it again here
+	// restarts the montage a round trip in, which shifts or duplicates the notify it is waiting on.
+	if (OwningPawn->IsLocallyControlled()) return;
+
 	Local_ReloadWeapon();
 }
 

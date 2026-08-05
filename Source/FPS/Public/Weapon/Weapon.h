@@ -73,6 +73,13 @@ public:
 	void Local_Fire(const FVector& ImpactPoint, const FVector& ImpactNormal, TEnumAsByte<EPhysicalSurface> ImpactSurfaceType, bool bIsFirstPerson);
 	void Auth_Fire();
 	void Rep_Fire(int32 AuthAmmo);
+
+	/**
+	 * Drops every outstanding client-side fire prediction. Must be called whenever Ammo is set from an
+	 * authoritative value instead of being reconciled shot by shot (reload, equip), otherwise Sequence
+	 * keeps offsetting Rep_Fire and the local mag reads short of the server's for the rest of the match.
+	 */
+	void ResetPredictionSequence() { Sequence = 0; }
 	
 	UPROPERTY(EditAnywhere, Category="FPS|Ammo")
 	int32 MagCapacity;
