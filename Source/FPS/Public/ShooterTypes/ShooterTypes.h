@@ -1,6 +1,10 @@
 ﻿#pragma once
 
+#include "CoreMinimal.h"
+#include "Templates/SubclassOf.h"
 #include "ShooterTypes.generated.h"
+
+class UCameraShakeBase;
 
 UENUM(BlueprintType)
 enum class ETurnInPlace : uint8
@@ -73,6 +77,207 @@ struct FReticleParams
 	
 	UPROPERTY(BlueprintReadWrite, EditAnywhere)
 	float TargetingPlayerInterpSpeed = 10.f;
+
+	/**
+	 * Sustained reticle opening that tracks the weapon's real bullet cone, expressed as a multiple of
+	 * ScaleFactor_RoundFired and reaching that multiple at full recoil heat. This is the one reticle term
+	 * driven by the *actual* cone rather than by a per-shot cosmetic bloom, so the crosshair cannot
+	 * under-report where rounds will go - which matters, because players calibrate their engagement range
+	 * against the crosshair.
+	 *
+	 * Deliberately a multiple of the existing per-shot term rather than an absolute number: that term is
+	 * already authored with the correct sign and magnitude for this weapon's reticle material, so scaling it
+	 * inherits both. An absolute value here would have to guess the material's sign convention, and guessing
+	 * it backwards would produce a crosshair that tightens as the cone opens. Set to 0 to opt out.
+	 */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	float SpreadScaleMultiplier = 2.5f;
+
+	/** How quickly the spread term follows the real cone. Fast on purpose - a laggy crosshair misinforms. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	float SpreadInterpSpeed = 18.f;
+};
+
+/**
+ * Everything about how one weapon kicks. Per weapon on purpose: recoil is the primary cost side of the
+ * GDD's loadout trade-offs (larger magazine vs faster reload, better hip-fire vs better ranged accuracy),
+ * so it has to be authorable per item rather than being a global rule.
+ *
+ * The whole struct is driven by one shared scalar - "heat" - which rises with each round fired and decays
+ * once firing stops. Spread, view punch and the visible weapon kick all scale off it, so a weapon's
+ * sustained-fire behaviour is tuned in one place and the three channels can never disagree about how hot
+ * the gun is. Heat is what makes recoil a function of *recency* of fire rather than of a single shot.
+ */
+USTRUCT(BlueprintType)
+struct FRecoilParams
+{
+	GENERATED_BODY()
+
+	// ---------------------------------------------------------------------------------------------
+	// Heat. The shared "how hard has this been fired lately" scalar, normalised 0-1.
+	// ---------------------------------------------------------------------------------------------
+
+	/** Heat added per round. 1 / this is roughly how many rounds it takes to reach full heat. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Heat", meta = (ClampMin = "0.0"))
+	float HeatPerShot = 0.22f;
+
+	/** Heat shed per second once the delay below has elapsed. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Heat", meta = (ClampMin = "0.0"))
+	float HeatDecayPerSecond = 1.1f;
+
+	/**
+	 * Grace period after the last round before heat starts falling. This is what stops a slow weapon from
+	 * cooling completely between its own shots: it must sit above FireTime for sustained fire to build
+	 * heat at all. A lever rifle with a 1.5s cycle and a 0.12s delay is fully cool on every shot by
+	 * design - its cost is paid in a single heavy kick, not in a climbing spray.
+	 */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Heat", meta = (ClampMin = "0.0"))
+	float HeatDecayDelay = 0.12f;
+
+	// ---------------------------------------------------------------------------------------------
+	// Bullet spread. The only channel that changes where rounds actually go.
+	// ---------------------------------------------------------------------------------------------
+
+	/** Cone half-angle in degrees at zero heat. 0 makes the first shot from cold perfectly accurate. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Spread", meta = (ClampMin = "0.0"))
+	float SpreadBaseDegrees = 0.25f;
+
+	/** Cone half-angle in degrees at full heat. The difference from base is the sustained-fire penalty. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Spread", meta = (ClampMin = "0.0"))
+	float SpreadMaxDegrees = 4.f;
+
+	/** Spread multiplier while aiming down sights. Below 1 makes ADS the accurate stance. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Spread", meta = (ClampMin = "0.0"))
+	float AimSpreadMultiplier = 0.35f;
+
+	/** Spread multiplier while moving faster than SpreadMovementSpeedThreshold. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Spread", meta = (ClampMin = "0.0"))
+	float MovingSpreadMultiplier = 1.35f;
+
+	/**
+	 * Spread multiplier while airborne. Deliberately the harshest of the three: the movement pillar wants
+	 * jumping and wall-jumping to be traversal tech, not a way to win a gunfight mid-air.
+	 */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Spread", meta = (ClampMin = "0.0"))
+	float AirborneSpreadMultiplier = 1.8f;
+
+	/** Ground speed above which MovingSpreadMultiplier applies. Sits under WalkSpeed so a walk is penalised. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Spread", meta = (ClampMin = "0.0"))
+	float SpreadMovementSpeedThreshold = 250.f;
+
+	// ---------------------------------------------------------------------------------------------
+	// View punch. Moves the actual aim point, so this is the channel that costs accuracy.
+	// ---------------------------------------------------------------------------------------------
+
+	/** Upward view kick in degrees for a shot fired from cold. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "View Punch")
+	float ViewPunchPitchMin = 0.5f;
+
+	/** Upward view kick in degrees at full heat. Above min so a held burst climbs. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "View Punch")
+	float ViewPunchPitchMax = 1.05f;
+
+	/**
+	 * Horizontal view kick in degrees, randomised within +/- this and scaled by heat. Left cold so the
+	 * first round of a burst goes exactly where it is aimed and only sustained fire wanders.
+	 */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "View Punch", meta = (ClampMin = "0.0"))
+	float ViewPunchYawRange = 0.35f;
+
+	/**
+	 * Ceiling on how far one burst may push the view up, in degrees. Without this a long auto burst walks
+	 * the crosshair into the sky, which reads as a bug rather than as recoil.
+	 */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "View Punch", meta = (ClampMin = "0.0"))
+	float ViewPunchMaxAccumulatedPitch = 7.f;
+
+	/** How quickly the punch is fed onto the view. High = snappy; low = a shove. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "View Punch", meta = (ClampMin = "0.1"))
+	float ViewPunchInterpSpeed = 24.f;
+
+	/**
+	 * Fraction of the accumulated punch that returns on its own, 0-1. Below 1 leaves the player to correct
+	 * the remainder by hand, which is what makes recoil control a skill rather than a formality.
+	 */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "View Punch", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float ViewRecoveryFraction = 0.8f;
+
+	/** Seconds after the last round before recovery begins, so it never fights an in-progress burst. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "View Punch", meta = (ClampMin = "0.0"))
+	float ViewRecoveryDelay = 0.07f;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "View Punch", meta = (ClampMin = "0.1"))
+	float ViewRecoverySpeed = 10.f;
+
+	/** View punch multiplier while aiming down sights. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "View Punch", meta = (ClampMin = "0.0"))
+	float AimViewPunchMultiplier = 0.65f;
+
+	// ---------------------------------------------------------------------------------------------
+	// Visible kick on the weapon mesh. Purely cosmetic - never touches the aim point or the trace.
+	// ---------------------------------------------------------------------------------------------
+
+	/** Centimetres the weapon is driven back toward the camera. The main "this gun has mass" cue. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Weapon Kick")
+	float WeaponKickBackward = 3.f;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Weapon Kick")
+	float WeaponKickUpward = 0.7f;
+
+	/** Degrees the muzzle rises. Reads as far more powerful than translation alone. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Weapon Kick")
+	float WeaponKickPitch = 4.f;
+
+	/** Randomised within +/- this, in degrees, so repeat shots never look identical. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Weapon Kick", meta = (ClampMin = "0.0"))
+	float WeaponKickYawRange = 1.f;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Weapon Kick", meta = (ClampMin = "0.0"))
+	float WeaponKickRollRange = 2.f;
+
+	/**
+	 * Ceiling on accumulated kick as a multiple of one shot's worth. Sustained fire stacks toward this
+	 * instead of restarting from rest each round - which is the concrete failure of driving kick from a
+	 * montage, where Montage_Play truncates the previous shot's recovery on every trigger pull.
+	 */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Weapon Kick", meta = (ClampMin = "1.0"))
+	float WeaponKickMaxAccumulated = 2.5f;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Weapon Kick", meta = (ClampMin = "0.1"))
+	float WeaponKickRecoverySpeed = 12.f;
+
+	/** Weapon kick multiplier while aiming. Trimmed so the sights stay readable, never to zero. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Weapon Kick", meta = (ClampMin = "0.0"))
+	float AimWeaponKickMultiplier = 0.55f;
+
+	// ---------------------------------------------------------------------------------------------
+	// Screen shake.
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * Peak procedural shake in degrees. Deliberately small - shake sells impact, but anything large enough
+	 * to notice consciously also costs the player the ability to track a target, and this is a 1v1 shooter.
+	 * Set to 0 to disable the built-in shake (an authored CameraShakeClass below still plays).
+	 */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Camera Shake", meta = (ClampMin = "0.0"))
+	float CameraShakeAmplitude = 0.5f;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Camera Shake", meta = (ClampMin = "0.0"))
+	float CameraShakeFrequency = 24.f;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Camera Shake", meta = (ClampMin = "0.0"))
+	float CameraShakeDuration = 0.2f;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Camera Shake", meta = (ClampMin = "0.0"))
+	float AimCameraShakeMultiplier = 0.5f;
+
+	/**
+	 * Optional authored shake, played through the camera manager in addition to the procedural one above.
+	 * Exists so a designer can curve-author a signature shake per weapon without code, exactly as
+	 * HitMarkerMaterial optionally replaces the painted hit marker. Leave unset for procedural only.
+	 */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Camera Shake")
+	TSubclassOf<UCameraShakeBase> CameraShakeClass;
 };
 
 /**

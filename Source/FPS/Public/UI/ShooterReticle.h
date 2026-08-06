@@ -70,6 +70,9 @@ private:
 	 */
 	const FHitMarkerParams& GetHitMarkerParams() const;
 
+	/** Current weapon's recoil heat, 0-1. Returns 0 with no pawn or no weapon yet. Never mutates state. */
+	float GetCurrentSpreadAlpha() const;
+
 	float BaseCornerScaleFactor;
 	float BaseShapeCutFactor;
 	float _BaseCornerScaleFactor_RoundFired;
@@ -77,6 +80,9 @@ private:
 	float _BaseCornerScaleFactor_Aiming;
 	float _BaseShapeCutFactor_Aiming;
 	float _BaseCornerScaleFactor_TargetingPlayer;
+
+	/** Sustained opening that tracks the weapon's real bullet cone. See the note at its use in NativeTick. */
+	float _BaseCornerScaleFactor_Spread;
 	float _HitMarkerIntensity;
 	float _HitMarkerLethal;
 	float _HitMarkerHeadshot;

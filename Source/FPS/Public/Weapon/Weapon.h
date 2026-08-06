@@ -44,7 +44,15 @@ public:
 	
 	void AttachToOwningPawn(APawn* Pawn) const;
 	void DetachFromOwningPawn();
-	void WeaponTrace(FHitResult& OutHit, float TraceLength);
+
+	/**
+	 * SpreadDegrees is the cone half-angle to scatter this shot within, and SpreadSeed picks where in that
+	 * cone it lands. The seed is passed rather than drawn locally because the server runs this trace again
+	 * for damage while the client's own run drives the tracer and impact FX - given the same seed and the
+	 * same angle both machines land on the same direction, so what the shooter sees is what the server
+	 * scores. Pass 0 spread for a perfectly centred shot.
+	 */
+	void WeaponTrace(FHitResult& OutHit, float TraceLength, float SpreadDegrees, uint16 SpreadSeed);
 	
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "FPS|WeaponType")
 	FGameplayTag WeaponType;
@@ -80,6 +88,24 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "FPS|Damage")
 	float HeadshotDamageMultiplier;
 
+	/**
+	 * When true, RecoilParams is replaced at BeginPlay by the preset for this weapon's WeaponType, so each
+	 * gun kicks differently with nothing authored per Blueprint. Untick to hand-tune a weapon: the values
+	 * already in RecoilParams are then used exactly as they stand.
+	 *
+	 * The presets live in C++ rather than in DA_WeaponData deliberately. Recoil is the cost side of a
+	 * weapon's trade-off, so it belongs next to Damage, FireTime and MagCapacity - which are all on the
+	 * weapon - rather than split into a second asset that could disagree with them.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category= "FPS|Recoil")
+	bool bUseRecoilTypePreset;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category= "FPS|Recoil")
+	FRecoilParams RecoilParams;
+
+	/** The authored preset for a weapon type. Falls back to a mid-weight automatic for unknown tags. */
+	static FRecoilParams GetRecoilPresetForWeaponType(const FGameplayTag& Type);
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category= "FPS|Reticle")
 	FReticleParams ReticleParams;
 
@@ -110,7 +136,49 @@ public:
 	 * keeps offsetting Rep_Fire and the local mag reads short of the server's for the rest of the match.
 	 */
 	void ResetPredictionSequence() { Sequence = 0; }
-	
+
+	// ---------------------------------------------------------------------------------------------
+	// Recoil. Heat lives on the weapon rather than on UCombatComponent so each gun cools on its own
+	// clock - swapping to a sidearm mid-burst must not hand it the rifle's accumulated spread, and the
+	// rifle must still be hot if you swap straight back.
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * Advances heat decay up to CurrentTime and returns the resulting 0-1 heat. Idempotent within a frame
+	 * and safe to call at any rate, because it integrates from the last time it was called rather than
+	 * assuming a fixed step - which is what lets the client call it every tick for its crosshair while the
+	 * server calls it only on the frames it actually resolves a shot.
+	 */
+	float AdvanceAndGetHeat(float CurrentTime);
+
+	/** Reads heat without advancing decay. For display and for anything that must not mutate state. */
+	float GetHeat() const { return SpreadHeat; }
+
+	/** Registers one round's worth of heat. Called on both the firing client and the authority. */
+	void AddRecoilHeat(float CurrentTime);
+
+	/** Clears heat and snaps the visible kick back to rest. Used on reload, equip and death. */
+	void ResetRecoilState();
+
+	/**
+	 * Final cone half-angle in degrees for a shot taken right now. Pure function of current heat and the
+	 * passed stance, so the firing client and the authority agree given the same stance.
+	 */
+	float GetSpreadDegrees(bool bIsAiming, bool bIsMoving, bool bIsAirborne) const;
+
+	/** Upward view punch in degrees for a shot taken at the current heat. Horizontal is drawn by the caller. */
+	float GetViewPunchPitch(bool bIsAiming) const;
+
+	/**
+	 * Kicks the visible weapon meshes. Cosmetic only - it writes the meshes' relative transforms and never
+	 * touches the aim point, the control rotation or the trace, so it is safe to run unpredicted on
+	 * simulated proxies and needs no server agreement.
+	 */
+	void ApplyWeaponKick(bool bIsAiming);
+
+	/** Interps the visible kick back toward rest. Driven from UCombatComponent's tick on every machine. */
+	void UpdateWeaponKick(float DeltaTime);
+
 	UPROPERTY(EditAnywhere, Category="FPS|Ammo")
 	int32 MagCapacity;
 	
@@ -147,10 +215,37 @@ protected:
 	TObjectPtr<USkeletalMeshComponent> Mesh3P;
 	
 private:
-	
+
 	void SetMeshVisibilities(APawn* OwningPawn) const;
-	
+
+	/** Caches the authored rest transforms of both meshes. Must run before any kick is applied. */
+	void CacheKickRestTransforms();
+
+	/** Writes the current kick offset onto both meshes, relative to their cached rest transforms. */
+	void ApplyKickToMeshes() const;
+
 	int32 Sequence;
+
+	// --- Recoil runtime state. Never replicated: the authority keeps its own copy for spread, and the
+	// visible kick is regenerated locally from each Local_Fire, so there is nothing worth sending. ---
+
+	/** Shared 0-1 "fired recently" scalar. Drives spread, view punch and kick magnitude together. */
+	float SpreadHeat;
+
+	/** World time of the most recent round, for the decay delay. */
+	float LastHeatShotTime;
+
+	/** World time decay was last integrated up to. Kept separate from LastHeatShotTime so an arbitrary
+	 *  call rate integrates exactly once over each interval instead of double-counting or skipping. */
+	float LastHeatDecayTime;
+
+	/** Current cosmetic offset from rest, in the meshes' parent space. */
+	FVector KickLocationOffset;
+	FRotator KickRotationOffset;
+
+	FTransform Mesh1PRestTransform;
+	FTransform Mesh3PRestTransform;
+	bool bKickRestTransformsCached;
 	
 	UPROPERTY(EditDefaultsOnly, Category= "FPS|Weapon")
 	TObjectPtr<UMaterialInterface> ReticleMaterial;

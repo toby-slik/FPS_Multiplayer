@@ -46,6 +46,8 @@ void UShooterReticle::NativeOnInitialized()
 	_BaseShapeCutFactor_RoundFired = 0.f;
 	_BaseCornerScaleFactor_Aiming = 0.f;
 	_BaseShapeCutFactor_Aiming = 0.f;
+	_BaseCornerScaleFactor_Spread = 0.f;
+	_BaseCornerScaleFactor_TargetingPlayer = 0.f;
 	_HitMarkerIntensity = 0.f;
 	_HitMarkerLethal = 0.f;
 	_HitMarkerHeadshot = 0.f;
@@ -120,6 +122,18 @@ const FHitMarkerParams& UShooterReticle::GetHitMarkerParams() const
 	return Weapon->HitMarkerParams;
 }
 
+float UShooterReticle::GetCurrentSpreadAlpha() const
+{
+	if (!CurrentCombat.IsValid()) return 0.f;
+
+	const AWeapon* Weapon = CurrentCombat->CurrentWeapon;
+	if (!IsValid(Weapon)) return 0.f;
+
+	// Read, never advanced. UCombatComponent::TickComponent owns settling the decay; if the widget advanced
+	// it too, the cone would cool at twice the authored rate on the client and disagree with the server's.
+	return FMath::Clamp(Weapon->GetHeat(), 0.f, 1.f);
+}
+
 void UShooterReticle::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
 {
 	Super::NativeTick(MyGeometry, InDeltaTime);
@@ -132,7 +146,20 @@ void UShooterReticle::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
 	
 	_BaseCornerScaleFactor_TargetingPlayer = FMath::FInterpTo(_BaseCornerScaleFactor_TargetingPlayer, bTargetingPlayer ? CurrentReticleParams.ScaleFactor_Targeting : CurrentReticleParams.ScaleFactor_NotTargeting, InDeltaTime, CurrentReticleParams.TargetingPlayerInterpSpeed);
 	
-	BaseCornerScaleFactor = _BaseCornerScaleFactor_RoundFired + _BaseCornerScaleFactor_Aiming + _BaseCornerScaleFactor_TargetingPlayer;
+	// Driven by the weapon's live recoil heat rather than by the fire event, which makes this the one
+	// reticle term that reports the *actual* bullet cone. _BaseCornerScaleFactor_RoundFired is a per-shot
+	// cosmetic punch that decays on its own timer and can disagree with the real spread; this cannot. A
+	// crosshair that under-reports its cone is worse than no feedback at all, because the player calibrates
+	// their engagement range against it.
+	// Expressed as a multiple of the already-authored per-shot term so it inherits that term's sign - the
+	// reticle material's convention for "open" is not knowable here, and getting it backwards would tighten
+	// the crosshair as the cone widens.
+	const float TargetSpreadScale = CurrentReticleParams.ScaleFactor_RoundFired
+		* CurrentReticleParams.SpreadScaleMultiplier
+		* GetCurrentSpreadAlpha();
+	_BaseCornerScaleFactor_Spread = FMath::FInterpTo(_BaseCornerScaleFactor_Spread, TargetSpreadScale, InDeltaTime, CurrentReticleParams.SpreadInterpSpeed);
+
+	BaseCornerScaleFactor = _BaseCornerScaleFactor_RoundFired + _BaseCornerScaleFactor_Aiming + _BaseCornerScaleFactor_TargetingPlayer + _BaseCornerScaleFactor_Spread;
 	BaseShapeCutFactor = _BaseShapeCutFactor_RoundFired + _BaseShapeCutFactor_Aiming;
 	
 	if (CurrentReticle_DynMatInst.IsValid())

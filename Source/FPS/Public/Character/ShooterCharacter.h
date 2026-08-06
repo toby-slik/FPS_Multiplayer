@@ -54,10 +54,13 @@ public:
 	virtual bool DoDamage_Implementation(float DamageAmount, AActor* DamageInstigator) override;
 	virtual bool IsAlive_Implementation() const override;
 	virtual TArray<FName> GetHeadshotBones_Implementation() const override;
+	virtual void AddCameraShake_Implementation(float Amplitude, float Frequency, float Duration, TSubclassOf<UCameraShakeBase> ShakeClass) override;
+	virtual bool IsMovingFasterThan_Implementation(float Speed) const override;
+	virtual bool IsAirborne_Implementation() const override;
 	/** ~PlayerInterface */
 
 	virtual void BeginPlay() override;
-	virtual void BeginDestroy() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 	/** Applies the directional air jump. The wall jump lives in UShooterMovementComponent::DoJump. */
 	virtual void OnJumped_Implementation() override;
@@ -97,7 +100,17 @@ public:
 	
 	UPROPERTY(EditDefaultsOnly, Category = "FPS|Respawn")
 	float RespawnTime;
-	
+
+	/**
+	 * Cancels any in-progress shake and settles the camera. Used on death.
+	 *
+	 * The shake itself is started through IPlayerInterface::AddCameraShake. It is implemented on the
+	 * character rather than on UCombatComponent because the first-person camera's relative rotation has
+	 * exactly one owner - see UpdateCameraOffsets. A second system calling SetRelativeRotation on it would
+	 * silently stomp the wall-run roll on alternating frames.
+	 */
+	void ClearCameraShake();
+
 protected:
 	
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "FPS|Mesh")
@@ -339,8 +352,28 @@ private:
 	/** Copies the movement component's predicted state onto the replicated anim mirrors. */
 	void UpdateMovementState();
 
-	void UpdateCameraRoll(float DeltaTime);
+	/**
+	 * The one and only writer of FirstPersonCamera's relative rotation. Composes the wall-run roll and the
+	 * weapon-fire shake into a single write so the two can never stomp each other.
+	 */
+	void UpdateCameraOffsets(float DeltaTime);
 	float CurrentCameraRoll;
+
+	/** Advances the shake clock and returns the rotation it contributes this frame. */
+	FRotator AdvanceCameraShake(float DeltaTime);
+
+	float CameraShakeAmplitude;
+	float CameraShakeFrequency;
+	float CameraShakeTotalDuration;
+	float CameraShakeTimeRemaining;
+
+	/**
+	 * Randomised per shot so consecutive rounds never shake along the same path. Without this a held burst
+	 * at a fixed frequency reads as a single smooth oscillation rather than as repeated impacts.
+	 */
+	float CameraShakePhasePitch;
+	float CameraShakePhaseYaw;
+	float CameraShakePhaseRoll;
 
 	/** Cached from GetCharacterMovement(); the class is swapped in via the FObjectInitializer. */
 	UPROPERTY()

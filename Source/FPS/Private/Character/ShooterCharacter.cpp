@@ -7,6 +7,8 @@
 #include "EnhancedInputComponent.h"
 #include "TimerManager.h"
 #include "Camera/CameraComponent.h"
+#include "Camera/CameraShakeBase.h"
+#include "Camera/PlayerCameraManager.h"
 #include "Combat/CombatComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Data/WeaponData.h"
@@ -126,6 +128,14 @@ AShooterCharacter::AShooterCharacter(const FObjectInitializer& ObjectInitializer
 	// countdowns advanced by DeltaTime, because world time differs between client and server
 	// and so can never be replayed correctly.
 	CurrentCameraRoll = 0.f;
+
+	CameraShakeAmplitude = 0.f;
+	CameraShakeFrequency = 0.f;
+	CameraShakeTotalDuration = 0.f;
+	CameraShakeTimeRemaining = 0.f;
+	CameraShakePhasePitch = 0.f;
+	CameraShakePhaseYaw = 0.f;
+	CameraShakePhaseRoll = 0.f;
 }
 
 void AShooterCharacter::GetLifetimeReplicatedProps(TArray<class FLifetimeProperty>& OutLifetimeProps) const
@@ -174,14 +184,11 @@ void AShooterCharacter::BeginPlay()
 	JumpMaxCount = FMath::Max(1, MaxJumpCount);
 }
 
-void AShooterCharacter::BeginDestroy()
+void AShooterCharacter::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-	Super::BeginDestroy();
-	
-	if (IsValid(Combat))
-	{
-		Combat->DestroyInventory();
-	}
+	// CombatComponent owns the inventory and tears it down from its own EndPlay. Actor teardown belongs
+	// here rather than BeginDestroy, which runs after replicated references may already be invalid.
+	Super::EndPlay(EndPlayReason);
 }
 
 FRotator AShooterCharacter::GetFixedRotation() const
@@ -208,7 +215,7 @@ void AShooterCharacter::Tick(float DeltaTime)
 	Super::Tick(DeltaTime);
 	
 	UpdateMovementState();
-	UpdateCameraRoll(DeltaTime);
+	UpdateCameraOffsets(DeltaTime);
 	CalculateTurnInPlaceParameters(DeltaTime);
 	CalculateFABRIKSocketTransform();
 }
@@ -344,8 +351,20 @@ void AShooterCharacter::OnRep_PlayerState()
 
 FName AShooterCharacter::GetWeaponAttachPoint_Implementation(const FGameplayTag& WeaponType) const
 {
-	checkf(Combat->WeaponData, TEXT("No Weapon Data Asset - Please fill out BP_ShooterCharacter"));
-	return Combat->WeaponData->GripPoints.FindChecked(WeaponType);
+	if (!IsValid(Combat) || !IsValid(Combat->WeaponData))
+	{
+		UE_LOG(LogTemp, Error, TEXT("%s has no weapon data asset"), *GetNameSafe(this));
+		return NAME_None;
+	}
+
+	if (const FName* AttachPoint = Combat->WeaponData->GripPoints.Find(WeaponType))
+	{
+		return *AttachPoint;
+	}
+
+	UE_LOG(LogTemp, Error, TEXT("No grip point configured for weapon tag %s on %s"),
+		*WeaponType.ToString(), *GetNameSafe(this));
+	return NAME_None;
 }
 
 USkeletalMeshComponent* AShooterCharacter::GetMesh1P_Implementation() const
@@ -398,8 +417,14 @@ void AShooterCharacter::OnDeathStarted()
 			if (PC->IsLocalController())
 			{
 				PC->bPawnAlive = false;
+
+				// Outstanding recoil has to go with the pawn. Input is disabled from here, so nothing
+				// would consume the queued kick, and it would otherwise be waiting to fire on the
+				// respawned pawn's first frame - the controller survives the death, the pawn does not.
+				PC->ResetViewRecoil();
 			}
 		}
+		ClearCameraShake();
 	}
 	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Pawn, ECR_Ignore);
 	GetCapsuleComponent()->SetCollisionResponseToChannel(FPSTraceChannels::ECC_Weapon, ECR_Ignore);
@@ -431,8 +456,11 @@ bool AShooterCharacter::DoDamage_Implementation(float DamageAmount, AActor* Dama
 
 	const bool bLethal = Health->ChangeHealthByAmount(-DamageAmount, DamageInstigator);
 
-	const int32 MontageSelection = FMath::RandRange(0, HitReacts.Num() - 1);
-	Multicast_HitReact(MontageSelection);
+	if (!HitReacts.IsEmpty())
+	{
+		const int32 MontageSelection = FMath::RandRange(0, HitReacts.Num() - 1);
+		Multicast_HitReact(MontageSelection);
+	}
 
 	return bLethal;
 }
@@ -455,7 +483,11 @@ void AShooterCharacter::Multicast_HitReact_Implementation(int32 MontageIndex)
 	{
 		if (HitReacts.IsValidIndex(MontageIndex))
 		{
-			GetMesh()->GetAnimInstance()->Montage_Play(HitReacts[MontageIndex]);
+			UAnimInstance* AnimInstance = IsValid(GetMesh()) ? GetMesh()->GetAnimInstance() : nullptr;
+			if (IsValid(AnimInstance) && IsValid(HitReacts[MontageIndex]))
+			{
+				AnimInstance->Montage_Play(HitReacts[MontageIndex]);
+			}
 		}
 	}
 }
@@ -616,7 +648,7 @@ void AShooterCharacter::OnJumped_Implementation()
 	}
 }
 
-void AShooterCharacter::UpdateCameraRoll(float DeltaTime)
+void AShooterCharacter::UpdateCameraOffsets(float DeltaTime)
 {
 	// Purely local feedback - the camera only exists on the owning client.
 	if (!IsLocallyControlled() || !IsValid(FirstPersonCamera)) return;
@@ -633,9 +665,101 @@ void AShooterCharacter::UpdateCameraRoll(float DeltaTime)
 	// Interped both ways, so the roll eases back to level when the run ends.
 	CurrentCameraRoll = FMath::FInterpTo(CurrentCameraRoll, TargetRoll, DeltaTime, WallRunCameraRollInterpSpeed);
 
+	const FRotator ShakeOffset = AdvanceCameraShake(DeltaTime);
+
 	// Relative to the SpringArm, which is the component driven by control rotation - so this
 	// adds roll without fighting the player's look input.
-	FRotator CameraRotation = FirstPersonCamera->GetRelativeRotation();
-	CameraRotation.Roll = CurrentCameraRoll;
+	//
+	// Set outright rather than read-modify-write: both terms are recomputed in full every frame, so
+	// composing them onto whatever was written last frame would integrate the shake instead of replacing
+	// it and the camera would walk away from level.
+	FRotator CameraRotation;
+	CameraRotation.Pitch = ShakeOffset.Pitch;
+	CameraRotation.Yaw = ShakeOffset.Yaw;
+	CameraRotation.Roll = CurrentCameraRoll + ShakeOffset.Roll;
 	FirstPersonCamera->SetRelativeRotation(CameraRotation);
+}
+
+bool AShooterCharacter::IsMovingFasterThan_Implementation(float Speed) const
+{
+	// Horizontal only. Falling speed is already covered by IsAirborne, and counting it here would apply
+	// the movement penalty on top of the airborne one for the same jump.
+	FVector Velocity = GetVelocity();
+	Velocity.Z = 0.f;
+	return Velocity.SizeSquared() > FMath::Square(Speed);
+}
+
+bool AShooterCharacter::IsAirborne_Implementation() const
+{
+	// Wall-running counts as airborne here, and should: it is a custom movement mode with no floor, and a
+	// player who is holding a wall has no more business landing precise shots than one mid-jump. Sliding
+	// stays on the ground, so it keeps the lighter movement penalty instead.
+	const UCharacterMovementComponent* MoveComp = GetCharacterMovement();
+	return IsValid(MoveComp) && !MoveComp->IsMovingOnGround();
+}
+
+void AShooterCharacter::AddCameraShake_Implementation(float Amplitude, float Frequency, float Duration,
+	TSubclassOf<UCameraShakeBase> ShakeClass)
+{
+	// The shake is a local cosmetic on the shooter's own view, so it has no business running anywhere else.
+	if (!IsLocallyControlled()) return;
+
+	if (IsValid(ShakeClass))
+	{
+		if (const APlayerController* PC = Cast<APlayerController>(GetController());
+			IsValid(PC) && IsValid(PC->PlayerCameraManager))
+		{
+			PC->PlayerCameraManager->StartCameraShake(ShakeClass);
+		}
+	}
+
+	if (Amplitude <= 0.f || Duration <= 0.f || Frequency <= 0.f) return;
+
+	// Amplitude takes the max of the outstanding shake rather than summing. At automatic fire rates a new
+	// shot lands long before the previous shake has finished, and summing drives the view into a blur that
+	// costs the player target tracking - which is unacceptable in a 1v1 where tracking is the whole game.
+	CameraShakeAmplitude = FMath::Max(Amplitude, CameraShakeAmplitude * (CameraShakeTotalDuration > 0.f
+		? FMath::Clamp(CameraShakeTimeRemaining / CameraShakeTotalDuration, 0.f, 1.f)
+		: 0.f));
+	CameraShakeFrequency = Frequency;
+	CameraShakeTotalDuration = Duration;
+	CameraShakeTimeRemaining = Duration;
+
+	CameraShakePhasePitch = FMath::FRandRange(0.f, 2.f * PI);
+	CameraShakePhaseYaw = FMath::FRandRange(0.f, 2.f * PI);
+	CameraShakePhaseRoll = FMath::FRandRange(0.f, 2.f * PI);
+}
+
+void AShooterCharacter::ClearCameraShake()
+{
+	CameraShakeAmplitude = 0.f;
+	CameraShakeTimeRemaining = 0.f;
+	CameraShakeTotalDuration = 0.f;
+}
+
+FRotator AShooterCharacter::AdvanceCameraShake(float DeltaTime)
+{
+	if (CameraShakeTimeRemaining <= 0.f || CameraShakeTotalDuration <= 0.f || CameraShakeAmplitude <= 0.f)
+	{
+		return FRotator::ZeroRotator;
+	}
+
+	CameraShakeTimeRemaining = FMath::Max(0.f, CameraShakeTimeRemaining - DeltaTime);
+
+	// Squared so the shake dies away quickly rather than trailing off linearly, which reads as a rattle
+	// that outlasts the shot.
+	const float Alpha = CameraShakeTimeRemaining / CameraShakeTotalDuration;
+	const float Envelope = Alpha * Alpha;
+	const float Elapsed = CameraShakeTotalDuration - CameraShakeTimeRemaining;
+	const float Amplitude = CameraShakeAmplitude * Envelope;
+
+	// Deliberately incommensurate multipliers on the three axes. At a shared frequency the axes stay in
+	// step and the view traces a clean ellipse, which reads as a wobble rather than as an impact. Roll is
+	// trimmed because roll is the axis the eye is least willing to forgive.
+	const float Base = 2.f * PI * CameraShakeFrequency * Elapsed;
+
+	return FRotator(
+		Amplitude * FMath::Sin(Base + CameraShakePhasePitch),
+		Amplitude * FMath::Sin(Base * 0.83f + CameraShakePhaseYaw),
+		Amplitude * 0.6f * FMath::Sin(Base * 1.17f + CameraShakePhaseRoll));
 }

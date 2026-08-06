@@ -92,6 +92,7 @@ public:
 	
 	
 protected:
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	
 	UPROPERTY(EditDefaultsOnly, Category = "FPS|Weapon")
 	float TraceLength;
@@ -114,8 +115,20 @@ private:
 	bool bHitPlayer;
 	bool bHitPlayerLastFrame;
 	bool bTriggerPressed;
+	bool bInventorySpawned;
 	FTimerHandle FireTimer;
+	double LastServerFireTime;
 	void FireTimerFinished();
+	/**
+	 * Settles Weapon's heat decay and returns the cone half-angle a shot taken right now should use.
+	 *
+	 * Called on both the firing client and the authority, and deliberately reads the *same* inputs on each,
+	 * so the two agree on the cone without anything being sent. Both are reading replicated stance, so at
+	 * high ping they can briefly disagree about a stance that changed mid-flight; the authority's answer is
+	 * the one that scores, and the divergence is bounded by one multiplier. That is why the cone is
+	 * recomputed here rather than trusted from the client - see Server_FireWeapon.
+	 */
+	float PrepareWeaponSpread(AWeapon* Weapon, APawn* OwningPawn) const;
 	
 	UFUNCTION()
 	void OnRep_CurrentWeapon(AWeapon* LastWeapon);
@@ -133,11 +146,25 @@ private:
 	UFUNCTION(Server, Reliable)
 	void Server_Aim(bool bPressed);
 	
+	/**
+	 * The server derives the hit from its own view; no client-authored FHitResult crosses the network.
+	 *
+	 * SpreadSeed only chooses *where in the cone* the round lands - the cone's size is recomputed here from
+	 * the authority's own heat, never taken from the client. That split is what makes it safe to let the
+	 * client influence spread at all: a forged seed can rotate a round around the cone, which buys nothing,
+	 * but it cannot shrink the cone, which would be an aimbot.
+	 */
 	UFUNCTION(Server, Reliable)
-	void Server_FireWeapon(const FHitResult& Hit);
+	void Server_FireWeapon(AWeapon* FiredWeapon, uint16 SpreadSeed);
 	
-	UFUNCTION(NetMulticast, Reliable)
-	void Multicast_FireWeapon(const FHitResult& Hit, int32 AuthAmmo);
+	/** Transient cosmetics must never block reliable gameplay traffic. */
+	UFUNCTION(NetMulticast, Unreliable)
+	void Multicast_FireWeapon(AWeapon* FiredWeapon, FVector_NetQuantize ImpactPoint,
+		FVector_NetQuantizeNormal ImpactNormal, uint8 ImpactSurfaceType, int32 AuthAmmo);
+
+	/** Rare correction used when the server rejects an over-rate or stale fire request. */
+	UFUNCTION(Client, Reliable)
+	void Client_CorrectFire(AWeapon* FiredWeapon, int32 AuthAmmo);
 	
 	void Local_Aim(bool bPressed);
 	void Local_FireWeapon();
@@ -213,6 +240,15 @@ private:
 	/** Sent by the owning client when its reload animation reaches the point the mag goes in. */
 	UFUNCTION(Server, Reliable)
 	void Server_CompleteReload();
+
+	// --- Recoil ------------------------------------------------------------------------------------
+
+	/**
+	 * View punch and screen shake for one round - the two recoil channels that only exist on the shooter's
+	 * own machine. Called from Local_FireWeapon only. The visible weapon kick is deliberately NOT here: it
+	 * has to run for observers too, so it is applied next to each Local_Fire instead.
+	 */
+	void ApplyLocalFireRecoil(AWeapon* FiredWeapon);
 
 	/** Sprint state of the owning pawn, asked through IPlayerInterface. */
 	bool IsOwnerSprinting() const;

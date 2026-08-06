@@ -9,10 +9,12 @@
 #include "Engine/Engine.h"
 #include "FPS/FPS.h"
 #include "GameFramework/Pawn.h"
+#include "GameFramework/PawnMovementComponent.h"
 #include "Interfaces/PlayerInterface.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "Net/UnrealNetwork.h"
 #include "PhysicalMaterials/PhysicalMaterial.h"
+#include "Player/ShooterPlayerController.h"
 #include "Weapon/Weapon.h"
 
 
@@ -23,11 +25,29 @@ UCombatComponent::UCombatComponent()
 	TraceLength = 20'000;
 	bAiming = false;
 	bTriggerPressed = false;
+	bInventorySpawned = false;
 	Local_WeaponIndex = 0;
+	LastServerFireTime = -1.0e9;
 	TargetingTraceInterval = 0.f;
 	TargetingTraceAccumulator = 0.f;
 	HeadshotValidationTolerance = 120.f;
 	bValidateHeadshotBonePosition = true;
+}
+
+void UCombatComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(FireTimer);
+	}
+	bTriggerPressed = false;
+
+	if (GetOwner() && GetOwner()->HasAuthority())
+	{
+		DestroyInventory();
+	}
+
+	Super::EndPlay(EndPlayReason);
 }
 
 
@@ -38,6 +58,14 @@ void UCombatComponent::TickComponent(float DeltaTime, ELevelTick TickType,
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 	
 	APawn* OwningPawn = Cast<APawn>(GetOwner());
+	if (IsValid(CurrentWeapon) && IsValid(GetWorld()))
+	{
+		CurrentWeapon->AdvanceAndGetHeat(GetWorld()->GetTimeSeconds());
+		if (GetNetMode() != NM_DedicatedServer)
+		{
+			CurrentWeapon->UpdateWeaponKick(DeltaTime);
+		}
+	}
 	if (!IsValid(OwningPawn) || !OwningPawn->IsLocallyControlled()) return;
 
 	// Optional throttle on the targeting-highlight trace below, which is the only per-frame work this
@@ -96,6 +124,7 @@ void UCombatComponent::GetLifetimeReplicatedProps(TArray<class FLifetimeProperty
 void UCombatComponent::Initiate_CycleWeapon()
 {
 	if (!IsValid(CurrentWeapon)) return;
+	if (Inventory.Num() < 2) return;
 	if (CurrentWeapon->WeaponStatus == EWeaponStatus::Cycling) return;
 	
 	AdvanceWeaponIndex();
@@ -112,6 +141,7 @@ void UCombatComponent::Initiate_CycleWeapon()
 void UCombatComponent::Notify_CycleWeapon()
 {
 	if (!IsValid(CurrentWeapon)) return;
+	if (!Inventory.IsValidIndex(Local_WeaponIndex)) return;
 	
 	AWeapon* NewWeapon = Inventory[Local_WeaponIndex];
 	if (IsValid(NewWeapon))
@@ -145,21 +175,29 @@ void UCombatComponent::Notify_ReloadWeapon()
 void UCombatComponent::Auth_ReloadWeapon()
 {
 	if (!IsValid(CurrentWeapon)) return;
+	int32* ReserveForWeapon = ReserveAmmo.Find(CurrentWeapon->WeaponType);
+	if (!ReserveForWeapon)
+	{
+		UE_LOG(LogTemp, Error, TEXT("Cannot reload %s: no reserve-ammo entry for tag %s"),
+			*GetNameSafe(CurrentWeapon), *CurrentWeapon->WeaponType.ToString());
+		return;
+	}
 
 	const int32 EmptySpace = CurrentWeapon->MagCapacity - CurrentWeapon->Ammo;
-	const int32 AmountToRefill = FMath::Min(EmptySpace, CurrentReserveAmmo);
+	const int32 AmountToRefill = FMath::Min(EmptySpace, *ReserveForWeapon);
 
 	CurrentWeapon->Ammo += AmountToRefill;
 	CurrentWeapon->WeaponStatus = EWeaponStatus::Idle;
 
-	ReserveAmmo[CurrentWeapon->WeaponType] -= AmountToRefill;
-	CurrentReserveAmmo = ReserveAmmo[CurrentWeapon->WeaponType];
+	*ReserveForWeapon -= AmountToRefill;
+	CurrentReserveAmmo = *ReserveForWeapon;
 
 	Client_ReloadWeapon(CurrentWeapon->Ammo, CurrentReserveAmmo);
 }
 
 void UCombatComponent::Server_CompleteReload_Implementation()
 {
+	if (!IsValid(CurrentWeapon) || CurrentWeapon->WeaponStatus != EWeaponStatus::Reloading) return;
 	Auth_ReloadWeapon();
 }
 
@@ -231,7 +269,10 @@ bool UCombatComponent::Auth_ValidateHeadshot(const FHitResult& Hit, FName BoneNa
 
 void UCombatComponent::BlendOut_CycleWeapon(UAnimMontage* Montage, bool bInterrupted)
 {
-	UAnimInstance* AnimInstance = IPlayerInterface::Execute_GetMesh1P(GetOwner())->GetAnimInstance();
+	if (!IsValid(CurrentWeapon) || !IsValid(GetOwner()) || !GetOwner()->Implements<UPlayerInterface>()) return;
+
+	USkeletalMeshComponent* Mesh1P = IPlayerInterface::Execute_GetMesh1P(GetOwner());
+	UAnimInstance* AnimInstance = IsValid(Mesh1P) ? Mesh1P->GetAnimInstance() : nullptr;
 	if (IsValid(AnimInstance) && AnimInstance->OnMontageBlendingOut.IsAlreadyBound(this, &ThisClass::BlendOut_CycleWeapon))
 	{
 		AnimInstance->OnMontageBlendingOut.RemoveDynamic(this, &ThisClass::BlendOut_CycleWeapon);
@@ -251,29 +292,44 @@ void UCombatComponent::BlendOut_CycleWeapon(UAnimMontage* Montage, bool bInterru
 
 void UCombatComponent::Local_CycleWeapon(int32 WeaponIndex)
 {
+	if (!Inventory.IsValidIndex(WeaponIndex) || !IsValid(CurrentWeapon) || !IsValid(WeaponData)) return;
 	AWeapon* NextWeapon = Inventory[WeaponIndex];
-	if (!IsValid(NextWeapon) || !IsValid(WeaponData)) return;
+	if (!IsValid(NextWeapon)) return;
 	CurrentWeapon->WeaponStatus = EWeaponStatus::Cycling;
 	NextWeapon->WeaponStatus = EWeaponStatus::Cycling;
 	
 	APawn* OwningPawn = Cast<APawn>(GetOwner());
 	const bool bIsLocal = IsValid(OwningPawn) && OwningPawn->IsLocallyControlled();
 	
-	const FMontageData& MontageData = bIsLocal ? WeaponData->FirstPersonMontages.FindChecked(NextWeapon->WeaponType) : WeaponData->ThirdPersonMontages.FindChecked(NextWeapon->WeaponType);
-	USkeletalMeshComponent* Mesh = bIsLocal ? IPlayerInterface::Execute_GetMesh1P(GetOwner()) : IPlayerInterface::Execute_GetMesh3P(GetOwner());
-	if (IsValid(Mesh) && IsValid(MontageData.EquipMontage))
+	const TMap<FGameplayTag, FMontageData>& MontageMap = bIsLocal ? WeaponData->FirstPersonMontages : WeaponData->ThirdPersonMontages;
+	const FMontageData* MontageData = MontageMap.Find(NextWeapon->WeaponType);
+	if (!MontageData)
 	{
-		Mesh->GetAnimInstance()->Montage_Play(MontageData.EquipMontage);
+		UE_LOG(LogTemp, Error, TEXT("Cannot cycle to %s: no %s montage data for tag %s"),
+			*GetNameSafe(NextWeapon), bIsLocal ? TEXT("first-person") : TEXT("third-person"),
+			*NextWeapon->WeaponType.ToString());
+		CurrentWeapon->WeaponStatus = EWeaponStatus::Idle;
+		NextWeapon->WeaponStatus = EWeaponStatus::Unequipped;
+		return;
 	}
-	if (bIsLocal)
+	USkeletalMeshComponent* Mesh = bIsLocal ? IPlayerInterface::Execute_GetMesh1P(GetOwner()) : IPlayerInterface::Execute_GetMesh3P(GetOwner());
+	UAnimInstance* AnimInstance = IsValid(Mesh) ? Mesh->GetAnimInstance() : nullptr;
+	if (IsValid(AnimInstance) && IsValid(MontageData->EquipMontage))
+	{
+		AnimInstance->Montage_Play(MontageData->EquipMontage);
+	}
+	if (bIsLocal && IsValid(AnimInstance))
 	{
 		ServerCycleWeapon(WeaponIndex);
-		Mesh->GetAnimInstance()->OnMontageBlendingOut.AddDynamic(this, &ThisClass::BlendOut_CycleWeapon);
+		AnimInstance->OnMontageBlendingOut.AddUniqueDynamic(this, &ThisClass::BlendOut_CycleWeapon);
 	}
 }
 
 void UCombatComponent::ServerCycleWeapon_Implementation(int32 WeaponIndex)
 {
+	if (!Inventory.IsValidIndex(WeaponIndex) || !IsValid(Inventory[WeaponIndex])) return;
+	if (Inventory[WeaponIndex]->GetOwner() != GetOwner()) return;
+
 	Local_WeaponIndex = WeaponIndex;
 	Multicast_CycleWeapon(WeaponIndex);
 }
@@ -341,34 +397,65 @@ void UCombatComponent::Initiate_FireWeapon_Pressed()
 
 void UCombatComponent::Local_FireWeapon()
 {
-	if (!IsValid(CurrentWeapon)) return;
+	AWeapon* FiredWeapon = CurrentWeapon;
+	if (!IsValid(FiredWeapon) || !IsValid(WeaponData) || !IsValid(GetOwner()) ||
+		!GetOwner()->Implements<UPlayerInterface>()) return;
 
 	// Backstop for the "cannot fire while sprinting" rule - covers the auto-fire loop
 	// re-entering through FireTimerFinished. By the time a cancelling press reaches here,
 	// CancelOwnerSprint has already run locally, so that shot still goes off.
 	if (IsOwnerSprinting()) return;
 
-	ensure(IsValid(WeaponData));
+	FiredWeapon->WeaponStatus = EWeaponStatus::Firing;
 	
-	CurrentWeapon->WeaponStatus = EWeaponStatus::Firing;
-	
-	UAnimMontage* Montage1P = WeaponData->FirstPersonMontages.FindChecked(CurrentWeapon->WeaponType).FireMontage;
-	USkeletalMeshComponent* Mesh1P = IPlayerInterface::Execute_GetMesh1P(GetOwner());
-	if (IsValid(Montage1P) && IsValid(Mesh1P))
+	UAnimMontage* Montage1P = nullptr;
+	if (const FMontageData* MontageData = WeaponData->FirstPersonMontages.Find(FiredWeapon->WeaponType))
 	{
-		Mesh1P->GetAnimInstance()->Montage_Play(Montage1P);
+		Montage1P = MontageData->FireMontage;
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("Missing first-person montage data for weapon tag %s"),
+			*FiredWeapon->WeaponType.ToString());
+	}
+	USkeletalMeshComponent* Mesh1P = IPlayerInterface::Execute_GetMesh1P(GetOwner());
+	UAnimInstance* AnimInstance1P = IsValid(Mesh1P) ? Mesh1P->GetAnimInstance() : nullptr;
+	if (IsValid(Montage1P) && IsValid(AnimInstance1P))
+	{
+		AnimInstance1P->Montage_Play(Montage1P);
 	}
 	
 	FHitResult Hit;
-	CurrentWeapon->WeaponTrace(Hit, TraceLength);
+	const uint16 SpreadSeed = static_cast<uint16>(FMath::RandHelper(MAX_uint16 + 1));
+	const float SpreadDegrees = PrepareWeaponSpread(FiredWeapon, Cast<APawn>(GetOwner()));
+	FiredWeapon->WeaponTrace(Hit, TraceLength, SpreadDegrees, SpreadSeed);
 	
 	EPhysicalSurface ImpactSurfaceType = Hit.PhysMaterial.IsValid(false) ? Hit.PhysMaterial->SurfaceType.GetValue() : SurfaceType1;
-	CurrentWeapon->Local_Fire(Hit.ImpactPoint, Hit.ImpactNormal, ImpactSurfaceType, true);
+	FiredWeapon->Local_Fire(Hit.ImpactPoint, Hit.ImpactNormal, ImpactSurfaceType, true);
+
+	// Before the heat this round adds, so the punch is priced on the heat the shot arrived with - exactly
+	// as the cone above was. Moving it after would make the first round of every burst kick as though it
+	// were the second.
+	ApplyLocalFireRecoil(FiredWeapon);
+
+	// On a listen-server host Server_FireWeapon below is the authority path and adds the heat itself, so
+	// adding it here as well would count every host shot twice and double the host's spread.
+	if (!FiredWeapon->HasAuthority())
+	{
+		FiredWeapon->AddRecoilHeat(GetWorld()->GetTimeSeconds());
+	}
+	if (GetNetMode() != NM_DedicatedServer)
+	{
+		FiredWeapon->ApplyWeaponKick(bAiming);
+	}
+
+	// On a listen-server host this executes immediately and spends the authoritative round before the UI
+	// broadcast below. Remote owning clients have already predicted their local ammo in Local_Fire.
+	Server_FireWeapon(FiredWeapon, SpreadSeed);
+
+	OnRoundFired.Broadcast(FiredWeapon->Ammo, FiredWeapon->MagCapacity, CurrentReserveAmmo);
 	
-	OnRoundFired.Broadcast(CurrentWeapon->Ammo, CurrentWeapon->MagCapacity, CurrentReserveAmmo);
-	
-	GetWorld()->GetTimerManager().SetTimer(FireTimer, this, &ThisClass::FireTimerFinished, CurrentWeapon->FireTime);
-	Server_FireWeapon(Hit);
+	GetWorld()->GetTimerManager().SetTimer(FireTimer, this, &ThisClass::FireTimerFinished, FiredWeapon->FireTime);
 }
 
 int32 UCombatComponent::AdvanceWeaponIndex()
@@ -410,13 +497,99 @@ void UCombatComponent::FireTimerFinished()
 	}
 }
 
-void UCombatComponent::Server_FireWeapon_Implementation(const FHitResult& Hit)
+float UCombatComponent::PrepareWeaponSpread(AWeapon* Weapon, APawn* OwningPawn) const
 {
-	if (!IsValid(CurrentWeapon)) return;
+	if (!IsValid(Weapon) || !IsValid(OwningPawn) || !IsValid(GetWorld())) return 0.f;
 
+	if (!OwningPawn->Implements<UPlayerInterface>()) return 0.f;
+
+	// Settled before the cone is measured, so the shot is priced on the heat it arrives with rather than on
+	// heat that has already been shed. The round's own contribution is added afterwards by the caller,
+	// which is what keeps the first shot from cold perfectly accurate.
+	Weapon->AdvanceAndGetHeat(GetWorld()->GetTimeSeconds());
+
+	const float MovementThreshold = FMath::Max(Weapon->RecoilParams.SpreadMovementSpeedThreshold, 0.f);
+
+	// Asked through the interface rather than read off the movement component directly, matching how the
+	// rest of this component reaches the pawn. It also gets wall-running right: a wall run is a custom
+	// movement mode, so IsFalling() is false throughout one and reading it here would have handed the
+	// player ground-grade accuracy for the whole run.
+	const bool bIsMoving = IPlayerInterface::Execute_IsMovingFasterThan(OwningPawn, MovementThreshold);
+	const bool bIsAirborne = IPlayerInterface::Execute_IsAirborne(OwningPawn);
+
+	return Weapon->GetSpreadDegrees(bAiming, bIsMoving, bIsAirborne);
+}
+
+void UCombatComponent::ApplyLocalFireRecoil(AWeapon* FiredWeapon)
+{
 	APawn* OwningPawn = Cast<APawn>(GetOwner());
-	if (!IsValid(OwningPawn)) return;
-	if (CurrentWeapon->Ammo <= 0) return;
+	if (!IsValid(FiredWeapon) || !IsValid(OwningPawn)) return;
+
+	// Both channels below are local cosmetics or local view state. On a listen-server host this function
+	// still runs - the host is locally controlled - but on a dedicated server there is no view to punch and
+	// no camera to shake, and Local_FireWeapon is only reached by the owning client in any case.
+	if (!OwningPawn->IsLocallyControlled()) return;
+
+	const FRecoilParams& Params = FiredWeapon->RecoilParams;
+
+	// --- View punch ---
+	// Queued on the controller rather than applied here, because the controller is the only place that can
+	// add to the view without fighting the player's own mouse for the frame - see UpdateRotation.
+	if (AShooterPlayerController* PC = Cast<AShooterPlayerController>(OwningPawn->GetController()); IsValid(PC))
+	{
+		const float PunchPitch = FiredWeapon->GetViewPunchPitch(bAiming);
+
+		// Scaled by heat so the first round of a burst goes exactly where it is aimed and only sustained
+		// fire wanders sideways. A cold weapon with any yaw at all makes single-shot weapons feel broken.
+		const float YawRange = FMath::Max(Params.ViewPunchYawRange, 0.f)
+			* (bAiming ? FMath::Max(Params.AimViewPunchMultiplier, 0.f) : 1.f)
+			* FMath::Clamp(FiredWeapon->GetHeat(), 0.f, 1.f);
+
+		const float PunchYaw = YawRange > 0.f ? FMath::FRandRange(-YawRange, YawRange) : 0.f;
+
+		PC->AddViewRecoil(PunchPitch, PunchYaw);
+	}
+
+	// --- Screen shake ---
+	const float ShakeScale = bAiming ? FMath::Max(Params.AimCameraShakeMultiplier, 0.f) : 1.f;
+	if (OwningPawn->Implements<UPlayerInterface>())
+	{
+		IPlayerInterface::Execute_AddCameraShake(
+			OwningPawn,
+			Params.CameraShakeAmplitude * ShakeScale,
+			Params.CameraShakeFrequency,
+			Params.CameraShakeDuration,
+			Params.CameraShakeClass);
+	}
+}
+
+void UCombatComponent::Server_FireWeapon_Implementation(AWeapon* FiredWeapon, uint16 SpreadSeed)
+{
+	APawn* OwningPawn = Cast<APawn>(GetOwner());
+	if (!IsValid(OwningPawn) || !IsValid(FiredWeapon)) return;
+	if (FiredWeapon != CurrentWeapon || !Inventory.Contains(FiredWeapon) || FiredWeapon->GetOwner() != GetOwner())
+	{
+		Client_CorrectFire(FiredWeapon, IsValid(FiredWeapon) ? FiredWeapon->Ammo : 0);
+		return;
+	}
+	if (FiredWeapon->Ammo <= 0)
+	{
+		Client_CorrectFire(FiredWeapon, FiredWeapon->Ammo);
+		return;
+	}
+
+	const double ServerTime = GetWorld()->GetTimeSeconds();
+	const double MinimumFireInterval = FMath::Max(static_cast<double>(FiredWeapon->FireTime) * 0.75, 0.01);
+	if (ServerTime - LastServerFireTime < MinimumFireInterval)
+	{
+		Client_CorrectFire(FiredWeapon, FiredWeapon->Ammo);
+		return;
+	}
+	LastServerFireTime = ServerTime;
+
+	FHitResult Hit;
+	const float SpreadDegrees = PrepareWeaponSpread(FiredWeapon, OwningPawn);
+	FiredWeapon->WeaponTrace(Hit, TraceLength, SpreadDegrees, SpreadSeed);
 
 	if (IsValid(Hit.GetActor()) && Hit.GetActor()->Implements<UPlayerInterface>())
 	{
@@ -430,7 +603,7 @@ void UCombatComponent::Server_FireWeapon_Implementation(const FHitResult& Hit)
 			// anything about weapon stats - it is handed a final number. It is also authority-only by
 			// construction: Local_FireWeapon does not scale damage at all, so a client cannot pre-apply it.
 			const bool bHeadshot = Auth_IsHeadshot(Hit);
-			const float DamageToApply = bHeadshot ? CurrentWeapon->Damage * CurrentWeapon->HeadshotDamageMultiplier : CurrentWeapon->Damage;
+			const float DamageToApply = bHeadshot ? FiredWeapon->Damage * FiredWeapon->HeadshotDamageMultiplier : FiredWeapon->Damage;
 
 			const bool bLethal = IPlayerInterface::Execute_DoDamage(Hit.GetActor(), DamageToApply, GetOwner());
 
@@ -443,36 +616,70 @@ void UCombatComponent::Server_FireWeapon_Implementation(const FHitResult& Hit)
 		}
 	}
 
-	// A locally controlled authority pawn already spent its round in Local_Fire.
-	// Remote clients need the server to spend the authoritative round here.
-	if (!OwningPawn->IsLocallyControlled())
-	{
-		CurrentWeapon->Auth_Fire();
-	}
-	
-	Multicast_FireWeapon(Hit, CurrentWeapon->Ammo);
+	FiredWeapon->Auth_Fire();
+	FiredWeapon->AddRecoilHeat(GetWorld()->GetTimeSeconds());
+
+	const EPhysicalSurface ImpactSurfaceType = Hit.PhysMaterial.IsValid(false)
+		? Hit.PhysMaterial->SurfaceType.GetValue()
+		: SurfaceType1;
+	Multicast_FireWeapon(FiredWeapon, Hit.ImpactPoint, Hit.ImpactNormal,
+		static_cast<uint8>(ImpactSurfaceType), FiredWeapon->Ammo);
 }
 
-void UCombatComponent::Multicast_FireWeapon_Implementation(const FHitResult& Hit, int32 AuthAmmo)
+void UCombatComponent::Multicast_FireWeapon_Implementation(AWeapon* FiredWeapon, FVector_NetQuantize ImpactPoint,
+	FVector_NetQuantizeNormal ImpactNormal, uint8 ImpactSurfaceType, int32 AuthAmmo)
 {
 	APawn* OwningPawn = Cast<APawn>(GetOwner());
+	if (!IsValid(OwningPawn) || !IsValid(FiredWeapon)) return;
+
 	if (OwningPawn->IsLocallyControlled())
 	{
-		CurrentWeapon->Rep_Fire(AuthAmmo);
+		FiredWeapon->Rep_Fire(AuthAmmo);
 	}
 	else
 	{
-		ensure(IsValid(WeaponData));
-		
-		EPhysicalSurface ImpactSurfaceType = Hit.PhysMaterial.IsValid(false) ? Hit.PhysMaterial->SurfaceType.GetValue() : SurfaceType1;
-		CurrentWeapon->Local_Fire(Hit.ImpactPoint, Hit.ImpactNormal, ImpactSurfaceType, false);
-	
-		UAnimMontage* Montage3P = WeaponData->ThirdPersonMontages.FindChecked(CurrentWeapon->WeaponType).FireMontage;
-		USkeletalMeshComponent* Mesh3P = IPlayerInterface::Execute_GetMesh3P(GetOwner());
-		if (IsValid(Montage3P) && IsValid(Mesh3P))
+		FiredWeapon->Local_Fire(ImpactPoint, ImpactNormal,
+			static_cast<EPhysicalSurface>(ImpactSurfaceType), false);
+		if (!FiredWeapon->HasAuthority() && IsValid(GetWorld()))
 		{
-			Mesh3P->GetAnimInstance()->Montage_Play(Montage3P);
+			FiredWeapon->AddRecoilHeat(GetWorld()->GetTimeSeconds());
 		}
+		if (GetNetMode() != NM_DedicatedServer)
+		{
+			FiredWeapon->ApplyWeaponKick(bAiming);
+		}
+
+		UAnimMontage* Montage3P = nullptr;
+		if (IsValid(WeaponData))
+		{
+			if (const FMontageData* MontageData = WeaponData->ThirdPersonMontages.Find(FiredWeapon->WeaponType))
+			{
+				Montage3P = MontageData->FireMontage;
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error, TEXT("Missing third-person montage data for weapon tag %s"),
+					*FiredWeapon->WeaponType.ToString());
+			}
+		}
+		USkeletalMeshComponent* Mesh3P = IPlayerInterface::Execute_GetMesh3P(GetOwner());
+		UAnimInstance* AnimInstance3P = IsValid(Mesh3P) ? Mesh3P->GetAnimInstance() : nullptr;
+		if (IsValid(Montage3P) && IsValid(AnimInstance3P))
+		{
+			AnimInstance3P->Montage_Play(Montage3P);
+		}
+	}
+}
+
+void UCombatComponent::Client_CorrectFire_Implementation(AWeapon* FiredWeapon, int32 AuthAmmo)
+{
+	if (!IsValid(FiredWeapon) || FiredWeapon->GetInstigator() != GetOwner()) return;
+
+	FiredWeapon->ResetPredictionSequence();
+	FiredWeapon->Ammo = FMath::Clamp(AuthAmmo, 0, FiredWeapon->MagCapacity);
+	if (FiredWeapon == CurrentWeapon)
+	{
+		OnRoundFired.Broadcast(FiredWeapon->Ammo, FiredWeapon->MagCapacity, CurrentReserveAmmo);
 	}
 }
 
@@ -489,7 +696,14 @@ void UCombatComponent::Initiate_ReloadWeapon()
 	if (CurrentReserveAmmo == 0) return;
 	
 	Local_ReloadWeapon();
-	Server_ReloadWeapon();
+	if (GetOwner() && GetOwner()->HasAuthority())
+	{
+		Multicast_ReloadWeapon();
+	}
+	else
+	{
+		Server_ReloadWeapon();
+	}
 	
 }
 
@@ -497,26 +711,41 @@ void UCombatComponent::Local_ReloadWeapon()
 {
 	
 	APawn* OwningPawn = Cast<APawn>(GetOwner());
-	if (!IsValid(CurrentWeapon) || !IsValid(OwningPawn)) return;
-	ensure(WeaponData);
+	if (!IsValid(CurrentWeapon) || !IsValid(OwningPawn) || !IsValid(WeaponData) ||
+		!OwningPawn->Implements<UPlayerInterface>()) return;
 	
 	const bool bIsLocal = OwningPawn->IsLocallyControlled();
-	UAnimMontage* ReloadMontage = bIsLocal ? WeaponData->FirstPersonMontages.FindChecked(CurrentWeapon->WeaponType).ReloadMontage : WeaponData->ThirdPersonMontages.FindChecked(CurrentWeapon->WeaponType).ReloadMontage;
-	USkeletalMeshComponent* Mesh = bIsLocal ? IPlayerInterface::Execute_GetMesh1P(OwningPawn) : IPlayerInterface::Execute_GetMesh3P(OwningPawn);
-	if (IsValid(ReloadMontage) && IsValid(Mesh))
+	const TMap<FGameplayTag, FMontageData>& MontageMap = bIsLocal ? WeaponData->FirstPersonMontages : WeaponData->ThirdPersonMontages;
+	const FMontageData* MontageData = MontageMap.Find(CurrentWeapon->WeaponType);
+	if (!MontageData)
 	{
-		Mesh->GetAnimInstance()->Montage_Play(ReloadMontage);
+		UE_LOG(LogTemp, Error, TEXT("Cannot reload %s: no %s montage data for tag %s"),
+			*GetNameSafe(CurrentWeapon), bIsLocal ? TEXT("first-person") : TEXT("third-person"),
+			*CurrentWeapon->WeaponType.ToString());
+		return;
+	}
+	UAnimMontage* ReloadMontage = MontageData->ReloadMontage;
+	USkeletalMeshComponent* Mesh = bIsLocal ? IPlayerInterface::Execute_GetMesh1P(OwningPawn) : IPlayerInterface::Execute_GetMesh3P(OwningPawn);
+	UAnimInstance* PlayerAnimInstance = IsValid(Mesh) ? Mesh->GetAnimInstance() : nullptr;
+	if (IsValid(ReloadMontage) && IsValid(PlayerAnimInstance))
+	{
+		PlayerAnimInstance->Montage_Play(ReloadMontage);
 	}
 
-	UAnimMontage* WeaponReloadMontage = WeaponData->WeaponMontages.FindChecked(CurrentWeapon->WeaponType).ReloadMontage;
+	UAnimMontage* WeaponReloadMontage = nullptr;
+	if (const FMontageData* WeaponMontageData = WeaponData->WeaponMontages.Find(CurrentWeapon->WeaponType))
+	{
+		WeaponReloadMontage = WeaponMontageData->ReloadMontage;
+	}
 	USkeletalMeshComponent* WeaponMesh = bIsLocal ? CurrentWeapon->GetMesh1P() : CurrentWeapon->GetMesh3P();
 	if (IsValid(WeaponReloadMontage) && IsValid(WeaponMesh))
 	{
 		if (UAnimInstance* AnimInstance = WeaponMesh->GetAnimInstance())
 		{
-			WeaponMesh->GetAnimInstance()->Montage_Play(WeaponReloadMontage);
+			AnimInstance->Montage_Play(WeaponReloadMontage);
 		}
 	}
+	CurrentWeapon->ResetRecoilState();
 	CurrentWeapon->WeaponStatus = EWeaponStatus::Reloading;
 
 	
@@ -525,6 +754,11 @@ void UCombatComponent::Local_ReloadWeapon()
 
 void UCombatComponent::Server_ReloadWeapon_Implementation()
 {
+	if (!IsValid(CurrentWeapon) || CurrentWeapon->WeaponStatus != EWeaponStatus::Idle) return;
+	if (CurrentWeapon->Ammo >= CurrentWeapon->MagCapacity) return;
+	const int32* ReserveForWeapon = ReserveAmmo.Find(CurrentWeapon->WeaponType);
+	if (!ReserveForWeapon || *ReserveForWeapon <= 0) return;
+
 	Multicast_ReloadWeapon();
 }
 
@@ -570,14 +804,13 @@ void UCombatComponent::Local_Aim(bool bPressed)
 
 void UCombatComponent::Equip(AWeapon* Weapon)
 {
-	
-	CurrentWeapon = Weapon;
-	CurrentWeapon->AttachToOwningPawn(Cast<APawn>(GetOwner()));
-	
+	if (!IsValid(Weapon) || Weapon->GetOwner() != GetOwner()) return;
+
+	SetCurrentWeapon(Weapon, CurrentWeapon);
+	if (!IsValid(CurrentWeapon)) return;
+
 	CurrentWeapon->WeaponStatus = EWeaponStatus::Idle;
-	
-	CurrentReserveAmmo = ReserveAmmo.FindChecked(CurrentWeapon->WeaponType);
-	OnCurrentReserveAmmoChanged.Broadcast(CurrentReserveAmmo, Weapon->Ammo, CurrentWeapon->WeaponIcon);
+	OnCurrentReserveAmmoChanged.Broadcast(CurrentReserveAmmo, CurrentWeapon->Ammo, CurrentWeapon->WeaponIcon);
 }
 
 void UCombatComponent::EquipWeapon(AWeapon* Weapon)
@@ -614,27 +847,62 @@ void UCombatComponent::SetCurrentWeapon(AWeapon* NewWeapon, AWeapon* LastWeapon)
 	
 	CurrentWeapon = NewWeapon;
 	APawn* OwningPawn = Cast<APawn>(GetOwner());
-	if (IsValid(OwningPawn) && OwningPawn->HasAuthority() && IsValid(CurrentWeapon))
+	if (!IsValid(CurrentWeapon) || !IsValid(OwningPawn)) return;
+
+	if (OwningPawn->HasAuthority())
 	{
-		CurrentReserveAmmo = ReserveAmmo.FindChecked(CurrentWeapon->WeaponType);
+		if (const int32* ReserveForWeapon = ReserveAmmo.Find(CurrentWeapon->WeaponType))
+		{
+			CurrentReserveAmmo = *ReserveForWeapon;
+		}
+		else
+		{
+			CurrentReserveAmmo = 0;
+			UE_LOG(LogTemp, Error, TEXT("Cannot equip %s: no reserve-ammo entry for tag %s"),
+				*GetNameSafe(CurrentWeapon), *CurrentWeapon->WeaponType.ToString());
+		}
 	}
 	
 	CurrentWeapon->AttachToOwningPawn(OwningPawn);
+	CurrentWeapon->WeaponStatus = EWeaponStatus::Idle;
 }
 
 void UCombatComponent::Server_EquipWeapon_Implementation(AWeapon* Weapon)
 {
-	EquipWeapon(Weapon);
+	if (!IsValid(Weapon) || !Inventory.Contains(Weapon) || Weapon->GetOwner() != GetOwner()) return;
+	SetCurrentWeapon(Weapon, CurrentWeapon);
 }
 
 void UCombatComponent::SpawnInventory()
 {
-	if (GetOwner()->GetLocalRole() < ROLE_Authority) return;
+	AActor* OwningActor = GetOwner();
+	if (!IsValid(OwningActor) || !OwningActor->HasAuthority() || bInventorySpawned) return;
+	bInventorySpawned = true;
 	
-	for (TSubclassOf<AWeapon>& WeaponClass : DefaultWeaponClass)
+	for (const TSubclassOf<AWeapon>& WeaponClass : DefaultWeaponClass)
 	{
+		if (!IsValid(WeaponClass.Get()))
+		{
+			UE_LOG(LogTemp, Error, TEXT("%s has an invalid DefaultWeaponClass entry"), *GetNameSafe(OwningActor));
+			continue;
+		}
+
 		AWeapon* Weapon = SpawnWeapon(WeaponClass);
-		Inventory.AddUnique(Weapon);
+		if (!IsValid(Weapon))
+		{
+			UE_LOG(LogTemp, Error, TEXT("Failed to spawn inventory weapon class %s for %s"),
+				*GetNameSafe(WeaponClass.Get()), *GetNameSafe(OwningActor));
+			continue;
+		}
+		if (ReserveAmmo.Contains(Weapon->WeaponType))
+		{
+			UE_LOG(LogTemp, Error, TEXT("Duplicate inventory weapon tag %s on %s; destroying duplicate %s"),
+				*Weapon->WeaponType.ToString(), *GetNameSafe(OwningActor), *GetNameSafe(Weapon));
+			Weapon->Destroy();
+			continue;
+		}
+
+		Inventory.Add(Weapon);
 		ReserveAmmo.Add(Weapon->WeaponType, Weapon->StartingCarriedAmmo);
 	}
 	
@@ -643,16 +911,46 @@ void UCombatComponent::SpawnInventory()
 		Equip(Inventory[0]);
 		InitializeWeaponWidgets();
 	}
+	else
+	{
+		bInventorySpawned = false;
+	}
 }
 
 void UCombatComponent::DestroyInventory()
 {
-	for (AWeapon* Weapon : Inventory)
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(FireTimer);
+	}
+	bTriggerPressed = false;
+	Local_WeaponIndex = 0;
+	LastServerFireTime = -1.0e9;
+	bInventorySpawned = false;
+
+	AWeapon* LastWeapon = CurrentWeapon;
+	CurrentWeapon = nullptr;
+	if (IsValid(LastWeapon))
+	{
+		LastWeapon->DetachFromOwningPawn();
+	}
+	CurrentReserveAmmo = 0;
+
+	TArray<AWeapon*> WeaponsToDestroy = MoveTemp(Inventory);
+	Inventory.Reset();
+	ReserveAmmo.Reset();
+
+	for (AWeapon* Weapon : WeaponsToDestroy)
 	{
 		if (IsValid(Weapon))
 		{
 			Weapon->Destroy();
 		}
+	}
+
+	if (AActor* OwningActor = GetOwner(); IsValid(OwningActor) && OwningActor->HasAuthority())
+	{
+		OwningActor->ForceNetUpdate();
 	}
 }
 
@@ -670,8 +968,12 @@ void UCombatComponent::InitializeWeaponWidgets() const
 void UCombatComponent::OnRep_CurrentWeapon(AWeapon* LastWeapon)
 {
 	SetCurrentWeapon(CurrentWeapon, LastWeapon);
-	
-	IPlayerInterface::Execute_WeaponReplicated(GetOwner());
+
+	if (!IsValid(CurrentWeapon)) return;
+	if (IsValid(GetOwner()) && GetOwner()->Implements<UPlayerInterface>())
+	{
+		IPlayerInterface::Execute_WeaponReplicated(GetOwner());
+	}
 	InitializeWeaponWidgets();
 }
 
@@ -682,6 +984,7 @@ AWeapon* UCombatComponent::SpawnWeapon(TSubclassOf<AWeapon> WeaponClass) const
 	AActor* OwningActor = GetOwner();
 	if (!IsValid(OwningActor)) return nullptr;
 	if (OwningActor->GetLocalRole() < ROLE_Authority) return nullptr;
+	if (!IsValid(WeaponClass.Get()) || !IsValid(GetWorld())) return nullptr;
 	
 	FActorSpawnParameters SpawnInfo;
 	SpawnInfo.Instigator = Cast<APawn>(OwningActor);

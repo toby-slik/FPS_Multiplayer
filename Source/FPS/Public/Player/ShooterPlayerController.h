@@ -19,16 +19,61 @@ class FPS_API AShooterPlayerController : public APlayerController
 	GENERATED_BODY()
 public:
 	AShooterPlayerController();
-	
+
 	bool bPawnAlive;
-	
-	
+
+	/**
+	 * Queues one round's worth of view kick, in degrees. Positive PitchUp raises the view.
+	 *
+	 * Only ever called on the machine that owns this controller. The kick reaches the authority the same
+	 * way ordinary mouse movement does - as part of the replicated control rotation - so the server's
+	 * damage trace already fires down the recoiled view with no extra plumbing and nothing to reconcile.
+	 */
+	void AddViewRecoil(float PitchUp, float Yaw);
+
+	/** Drops all outstanding kick and recovery. Used on death and on anything that reslots the weapon. */
+	void ResetViewRecoil();
+
 protected:
 	virtual void BeginPlay() override;
 	virtual void SetupInputComponent() override;
-	
+
+	/**
+	 * Recoil is injected here, into RotationInput, before Super consumes it - not by writing control
+	 * rotation afterwards. That ordering matters: it leaves pitch clamping, ProcessViewRotation and the
+	 * pawn's FaceRotation entirely to the engine, so recoil cannot push the view past the camera
+	 * manager's limits or desync the mesh yaw from the camera by a frame.
+	 */
+	virtual void UpdateRotation(float DeltaTime) override;
+
 private:
-	
+
+	/**
+	 * Advances the recoil state by DeltaTime and returns the rotation delta to add this frame.
+	 * PlayerLookThisFrame is the player's own input for the frame, already accumulated into RotationInput
+	 * but not yet applied, and is used to let manual correction retire recovery credit - see the note in
+	 * the implementation.
+	 */
+	FRotator ConsumeViewRecoil(float DeltaTime, const FRotator& PlayerLookThisFrame);
+
+	/** Kick queued by AddViewRecoil but not yet fed onto the view. */
+	float RecoilPendingPitch;
+	float RecoilPendingYaw;
+
+	/**
+	 * How far recoil currently has the view off the player's aim point, in degrees of pitch. This is what
+	 * ViewPunchMaxAccumulatedPitch caps, so the ceiling is on the standing offset rather than on lifetime
+	 * kick - it falls again as recovery returns pitch or as the player corrects by hand.
+	 */
+	float RecoilStandingPitch;
+
+	/** The portion of applied kick still eligible to return on its own. */
+	float RecoilRecoverablePitch;
+	float RecoilRecoverableYaw;
+
+	/** Seconds since the last queued kick, for the recovery delay. */
+	float TimeSinceLastViewPunch;
+
 	UPROPERTY(EditAnywhere, Category= "FPS|Input")
 	TObjectPtr<UInputMappingContext> ShooterIMC;
 	

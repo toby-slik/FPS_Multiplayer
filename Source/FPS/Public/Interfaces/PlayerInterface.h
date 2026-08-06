@@ -3,8 +3,11 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Templates/SubclassOf.h"
 #include "UObject/Interface.h"
 #include "PlayerInterface.generated.h"
+
+class UCameraShakeBase;
 
 // This class does not need to be modified.
 UINTERFACE()
@@ -89,5 +92,26 @@ public:
 	 */
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
 	TArray<FName> GetHeadshotBones() const;
+
+	/**
+	 * Starts a screen shake on this pawn's own view. Amplitude is peak degrees, Frequency is in Hz.
+	 * ShakeClass is an optional authored shake played in addition to the procedural one.
+	 *
+	 * Implementations must no-op unless the pawn is locally controlled - the shake is a local cosmetic, and
+	 * UCombatComponent calls this from paths that also run on the authority and on simulated proxies.
+	 */
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
+	void AddCameraShake(float Amplitude, float Frequency, float Duration, TSubclassOf<UCameraShakeBase> ShakeClass);
+
+	/**
+	 * True while the pawn is moving fast enough for the movement spread penalty, and separately while it is
+	 * airborne. Asked of the pawn rather than read off a movement component so the combat code stays free of
+	 * any assumption about how this character moves.
+	 */
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
+	bool IsMovingFasterThan(float Speed) const;
+
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
+	bool IsAirborne() const;
 
 };
