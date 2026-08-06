@@ -80,9 +80,16 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "FPS|Damage")
 	float HeadshotDamageMultiplier;
 
-	UPROPERTY(EditDefaultsOnly, Category= "FPS|Reticle")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category= "FPS|Reticle")
 	FReticleParams ReticleParams;
-	
+
+	/**
+	 * Read live by UShooterReticle every frame, so a Blueprint writing to this at runtime changes the
+	 * marker immediately. Not snapshotted anywhere on the widget - see UShooterReticle::GetHitMarkerParams.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "FPS|HitMarker")
+	FHitMarkerParams HitMarkerParams;
+
 	UPROPERTY(EditDefaultsOnly, Category= "FPS|Icon")
 	TObjectPtr<UMaterialInterface> WeaponIcon;
 	

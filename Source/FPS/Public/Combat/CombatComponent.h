@@ -95,13 +95,22 @@ protected:
 	
 	UPROPERTY(EditDefaultsOnly, Category = "FPS|Weapon")
 	float TraceLength;
-	
+
+	/**
+	 * Seconds between targeting-highlight traces in TickComponent. 0 = every frame, which is the intended
+	 * value - see the note at the throttle itself. Raising this trades highlight responsiveness for a saving
+	 * that is below the noise floor at 1v1, so only raise it with a profile in hand.
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "FPS|Reticle")
+	float TargetingTraceInterval;
+
 	UFUNCTION()
 	void BlendOut_CycleWeapon(UAnimMontage* Montage, bool bInterrupted);
 
 private:
 	
 	TMap<FGameplayTag, int32> ReserveAmmo;
+	float TargetingTraceAccumulator;
 	bool bHitPlayer;
 	bool bHitPlayerLastFrame;
 	bool bTriggerPressed;

@@ -73,8 +73,18 @@ struct FReticleParams
 	
 	UPROPERTY(BlueprintReadWrite, EditAnywhere)
 	float TargetingPlayerInterpSpeed = 10.f;
+};
 
-	// Hit Marker
+/**
+ * Hit marker look and feel. Split out of FReticleParams rather than living in it because Category on a
+ * UPROPERTY inside a USTRUCT is ignored - the Details panel always nests struct members under the
+ * containing property's category - so its own struct is the only way these get their own FPS|HitMarker
+ * heading. The split is also the honest one: reticle shape and hit feedback are separate concerns.
+ */
+USTRUCT(BlueprintType)
+struct FHitMarkerParams
+{
+	GENERATED_BODY()
 
 	/** Added to the marker's intensity on every server-confirmed hit. Accumulates under auto-fire, so a
 	 *  burst reads brighter than a single round rather than restarting from zero each time. */
@@ -129,6 +139,22 @@ struct FReticleParams
 	/** Colour of a normal confirmed hit. Water teal, per the HUD palette. */
 	UPROPERTY(BlueprintReadWrite, EditAnywhere)
 	FLinearColor HitMarkerColor = FLinearColor(0.25f, 0.85f, 0.85f, 1.f);
+
+	/**
+	 * Colour a headshot blends toward. Unlike the lethal red this needs no exception - it is the sunlit
+	 * gold already in the world palette, so it reads as part of the same visual system as the rest of the
+	 * HUD. Encodes to roughly #FFDD61.
+	 *
+	 * The two numbers that matter are chosen against the other two marker states rather than in isolation:
+	 * blue is held right down at 0.12 so the hue cannot drift toward the teal non-lethal marker as the
+	 * marker desaturates against the background mid-fade - a gold with a blue lift is exactly what reads
+	 * as "dirty teal" at low opacity. Green sits at 0.72 rather than at full, because a full-green gold
+	 * goes chartreuse, and chartreuse is the one warm hue that sits close to teal's green-cyan
+	 * neighbourhood. Red stays at 1.0 so apparent brightness survives the alpha fade. The result lands at
+	 * hue ~48 degrees, clear of both the teal (~180) and the lethal scarlet (~358).
+	 */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	FLinearColor HitMarkerColor_Headshot = FLinearColor(1.f, 0.72f, 0.12f, 1.f);
 
 	/**
 	 * Colour a kill blends toward. A deliberate, approved exception to the world-palette HUD rule - a kill

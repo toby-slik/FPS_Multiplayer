@@ -7,8 +7,9 @@
 #include "Weapon/Weapon.h"
 #include "ShooterReticle.generated.h"
 
-class UImage; 
+class UImage;
 class UMaterialInstanceDynamic;
+class UCombatComponent;
 
 
 UCLASS()
@@ -37,7 +38,7 @@ public:
 	/**
 	 * Hit marker art. Lives on the widget rather than on AWeapon because the marker is a HUD-global
 	 * element - it must survive a weapon cycle mid-burst, and there is no reason for a shotgun to
-	 * own a different marker. The per-weapon *feel* is still authorable via FReticleParams.
+	 * own a different marker. The per-weapon *feel* is still authorable via FHitMarkerParams.
 	 */
 	UPROPERTY(EditDefaultsOnly, Category = "FPS|Reticle")
 	TObjectPtr<UMaterialInterface> HitMarkerMaterial;
@@ -52,6 +53,23 @@ private:
 	TObjectPtr<UMaterialInstanceDynamic> HitMarker_DynMatInst;
 
 	FReticleParams CurrentReticleParams;
+
+	/**
+	 * Resolved once per possession in OnPossesedPawnChanged, never in NativeTick. Exists so the marker can
+	 * read HitMarkerParams off the live weapon instead of a snapshot: UCombatComponent::CurrentWeapon is
+	 * already the replicated source of truth for which weapon is current, so a weapon cycle needs no extra
+	 * plumbing here and the widget never holds a second, drifting copy of that answer.
+	 */
+	TWeakObjectPtr<UCombatComponent> CurrentCombat;
+
+	/**
+	 * The current weapon's hit marker tuning, read live so a Blueprint write lands on the very next frame.
+	 * Returns a default-constructed fallback when there is no pawn or no weapon yet - between death and
+	 * respawn, or before the weapon first replicates. Safe to call every frame; it is two weak/IsValid
+	 * checks and a pointer hop, no component lookup and no cast.
+	 */
+	const FHitMarkerParams& GetHitMarkerParams() const;
+
 	float BaseCornerScaleFactor;
 	float BaseShapeCutFactor;
 	float _BaseCornerScaleFactor_RoundFired;
@@ -61,12 +79,20 @@ private:
 	float _BaseCornerScaleFactor_TargetingPlayer;
 	float _HitMarkerIntensity;
 	float _HitMarkerLethal;
+	float _HitMarkerHeadshot;
 
 	/**
 	 * Latched by a confirmed kill and only released once the marker has fully faded out. The lethal
 	 * look has to hold for the marker's whole visible life - see the note in NativeTick.
 	 */
 	bool _bHitMarkerLethalLatched;
+
+	/**
+	 * Latched by a confirmed headshot, released on exactly the same condition as the lethal latch and for
+	 * exactly the same reason: a headshot that only reads gold for the first few frames of a marker that
+	 * stays up for most of a second reads as "the headshot marker is teal".
+	 */
+	bool _bHitMarkerHeadshotLatched;
 	bool bAiming;
 	bool bTargetingPlayer;
 

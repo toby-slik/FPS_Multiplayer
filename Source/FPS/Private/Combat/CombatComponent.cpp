@@ -24,6 +24,8 @@ UCombatComponent::UCombatComponent()
 	bAiming = false;
 	bTriggerPressed = false;
 	Local_WeaponIndex = 0;
+	TargetingTraceInterval = 0.f;
+	TargetingTraceAccumulator = 0.f;
 	HeadshotValidationTolerance = 120.f;
 	bValidateHeadshotBonePosition = true;
 }
@@ -37,7 +39,19 @@ void UCombatComponent::TickComponent(float DeltaTime, ELevelTick TickType,
 	
 	APawn* OwningPawn = Cast<APawn>(GetOwner());
 	if (!IsValid(OwningPawn) || !OwningPawn->IsLocallyControlled()) return;
-	
+
+	// Optional throttle on the targeting-highlight trace below, which is the only per-frame work this
+	// component does. 0 means every frame, and 0 is the intended shipping value: the highlight has to track
+	// the crosshair crossing the opponent, and any interval long enough to save time worth measuring is also
+	// long enough to see the highlight lag the aim. Exposed purely so the cost can be dialled back if a
+	// profile ever disagrees - measure before raising it.
+	if (TargetingTraceInterval > 0.f)
+	{
+		TargetingTraceAccumulator += DeltaTime;
+		if (TargetingTraceAccumulator < TargetingTraceInterval) return;
+		TargetingTraceAccumulator = 0.f;
+	}
+
 	APlayerController* PC = Cast<APlayerController>(OwningPawn->GetController());
 	if (!IsValid(PC)) return;
 	
@@ -175,8 +189,6 @@ void UCombatComponent::Client_ReloadWeapon_Implementation(int32 NewWeaponAmmo, i
 
 void UCombatComponent::Client_ConfirmHit_Implementation(bool bLethal, bool bHeadshot, float DamageDealt)
 {
-	// bHeadshot is carried but currently unused by the HUD - the hit marker's headshot look is still an
-	// open art decision. It is plumbed now so adding the visual is a widget-only change later.
 	OnHitConfirmed.Broadcast(bLethal, bHeadshot, DamageDealt);
 }
 
