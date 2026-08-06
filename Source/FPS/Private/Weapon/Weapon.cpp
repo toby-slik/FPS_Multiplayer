@@ -149,6 +149,15 @@ void AWeapon::Local_Fire(const FVector& ImpactPoint, const FVector& ImpactNormal
 	}
 }
 
+void AWeapon::Local_DryFire(bool bReloadStarted)
+{
+	APawn* InstigatingPawn = GetInstigator();
+	if (!IsValid(InstigatingPawn)) return;
+	if (!InstigatingPawn->IsLocallyControlled()) return;
+
+	DryFireEffects(bReloadStarted);
+}
+
 void AWeapon::Auth_Fire()
 {
 	Ammo = FMath::Clamp(Ammo -1, 0, MagCapacity);

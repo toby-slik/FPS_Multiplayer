@@ -94,6 +94,13 @@ public:
 	TObjectPtr<UMaterialInterface> WeaponIcon;
 	
 	void Local_Fire(const FVector& ImpactPoint, const FVector& ImpactNormal, TEnumAsByte<EPhysicalSurface> ImpactSurfaceType, bool bIsFirstPerson);
+
+	/**
+	 * Trigger pulled on an empty magazine. Purely cosmetic and deliberately never replicated, so it is
+	 * guarded to the locally controlled instigator - a simulated proxy or a dedicated server must stay silent.
+	 */
+	void Local_DryFire(bool bReloadStarted);
+
 	void Auth_Fire();
 	void Rep_Fire(int32 AuthAmmo);
 
@@ -120,6 +127,16 @@ protected:
 
 	UFUNCTION(BlueprintImplementableEvent)
 	void FireEffects(const FVector& ImpactPoint, const FVector& ImpactNormal, EPhysicalSurface ImpactSurfaceType, bool bIsFirstPerson);
+
+	/**
+	 * Authored in the weapon Blueprint alongside FireEffects, using the existing ATT_* attenuation and
+	 * SCON_Guns_* concurrency assets. bReloadStarted is true when the same press also began a reload
+	 * (the mag was empty but the reserve was not), so the click can be softened or skipped rather than
+	 * fighting the reload foley. False means the reserve is empty too and this event is the only
+	 * feedback the player gets for that press.
+	 */
+	UFUNCTION(BlueprintImplementableEvent)
+	void DryFireEffects(bool bReloadStarted);
 
 	// Weapon Mesh: 1st person view
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "FPS|Weapon")

@@ -326,7 +326,13 @@ void UCombatComponent::Initiate_FireWeapon_Pressed()
 	// whether there is anything to reload with, so an empty reserve is a no-op as before.
 	if (CurrentWeapon->Ammo <= 0)
 	{
+		// Asked after the fact rather than re-testing Initiate_ReloadWeapon's conditions here, so the two
+		// can never disagree about whether a reload is running. Local_ReloadWeapon is what sets Reloading,
+		// and the status guard above guarantees it was Idle a line ago.
 		Initiate_ReloadWeapon();
+		const bool bReloadStarted = CurrentWeapon->WeaponStatus == EWeaponStatus::Reloading;
+
+		CurrentWeapon->Local_DryFire(bReloadStarted);
 		return;
 	}
 
