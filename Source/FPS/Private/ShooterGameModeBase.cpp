@@ -4,6 +4,7 @@
 #include "ShooterGameModeBase.h"
 
 
+#include "AIController.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/PlayerStart.h"
 #include "Kismet/GameplayStatics.h"
@@ -21,4 +22,14 @@ void AShooterGameModeBase::RequestRespawn(ACharacter* Character, AController* Co
 	int32 Selection = FMath::RandRange(0, PlayerStarts.Num() - 1);
 	
 	RestartPlayerAtPlayerStart(Controller, PlayerStarts[Selection]);
+}
+
+UClass* AShooterGameModeBase::GetDefaultPawnClassForController_Implementation(AController* InController)
+{
+	if (IsValid(BotPawnClass) && InController && InController->IsA<AAIController>())
+	{
+		return BotPawnClass;
+	}
+
+	return Super::GetDefaultPawnClassForController_Implementation(InController);
 }

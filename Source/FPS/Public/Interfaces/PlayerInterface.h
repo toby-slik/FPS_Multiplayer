@@ -114,4 +114,21 @@ public:
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
 	bool IsAirborne() const;
 
+	/**
+	 * True only on the machine that renders this pawn through its own eyes - i.e. a human player's own pawn.
+	 *
+	 * This exists because IsLocallyControlled() is NOT the same question, and the difference only surfaces
+	 * once an AI pawn exists. An AI controller lives on the authority, so an AI-controlled pawn reports
+	 * IsLocallyControlled() == true on the server, and therefore on a listen-server host. Every fire, reload
+	 * and cycle path used to pick first-person assets off that answer, which meant a bot played its montages
+	 * on Mesh1P - a mesh flagged bOnlyOwnerSee that nobody is looking through - and, because
+	 * Multicast_FireWeapon skips locally controlled pawns, never played its third-person montage for the
+	 * human at all. The bot appeared to shoot nothing.
+	 *
+	 * So: ask IsLocallyControlled() when the question is "does this machine drive the logic and own the
+	 * prediction". Ask this when the question is "should this use first-person assets".
+	 */
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
+	bool IsFirstPersonViewer() const;
+
 };

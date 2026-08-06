@@ -57,6 +57,7 @@ public:
 	virtual void AddCameraShake_Implementation(float Amplitude, float Frequency, float Duration, TSubclassOf<UCameraShakeBase> ShakeClass) override;
 	virtual bool IsMovingFasterThan_Implementation(float Speed) const override;
 	virtual bool IsAirborne_Implementation() const override;
+	virtual bool IsFirstPersonViewer_Implementation() const override;
 	/** ~PlayerInterface */
 
 	virtual void BeginPlay() override;

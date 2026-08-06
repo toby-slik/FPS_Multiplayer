@@ -6,9 +6,11 @@
 #include "Components/ActorComponent.h"
 #include "GameFramework/Actor.h"
 #include "GameplayTagContainer.h"
+#include "ShooterTypes/AttachmentTypes.h"
 #include "CombatComponent.generated.h"
 
 
+class UAttachmentData;
 class UMaterialInstanceDynamic;
 class UWeaponData;
 class AWeapon;
@@ -86,7 +88,30 @@ public:
 	TObjectPtr<AWeapon> CurrentWeapon;
 	
 	void InitializeWeaponWidgets() const;
-	
+
+	// --- Attachments ---------------------------------------------------------------------------------
+
+	/**
+	 * Authority-only entry point for putting an attachment on one of this pawn's weapons. There is deliberately
+	 * no Initiate_/Server_ pair and no client path: unlike firing, nothing about equipping needs to feel
+	 * instant, and the loadout screen, the per-round rarity reroll and the post-match steal are all decisions
+	 * the server makes anyway. Prediction here would only create a state a client could disagree about.
+	 *
+	 * Weapon must be in this component's Inventory. Returns false and changes nothing otherwise.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "FPS|Attachments")
+	bool Auth_EquipAttachment(AWeapon* Weapon, UAttachmentData* Definition, EAttachmentRarity InstanceRarity);
+
+	UFUNCTION(BlueprintCallable, Category = "FPS|Attachments")
+	bool Auth_RemoveAttachment(AWeapon* Weapon, EAttachmentSlot Slot);
+
+	/**
+	 * Called by AWeapon on every machine once its attachment list has changed and its effective stats have been
+	 * rebuilt. Only redraws the ammo HUD - the mag size it is displaying may have just moved. Broadcasting on a
+	 * dedicated server is harmless; there are no listeners there.
+	 */
+	void NotifyAttachmentsChanged(const AWeapon* Weapon) const;
+
 	UPROPERTY(ReplicatedUsing = OnRep_CurrentReserveAmmo)
 	int32 CurrentReserveAmmo;
 	
@@ -252,6 +277,16 @@ private:
 
 	/** Sprint state of the owning pawn, asked through IPlayerInterface. */
 	bool IsOwnerSprinting() const;
+
+	/**
+	 * True when this pawn should use first-person assets - its own arms, Mesh1P montages, the 1P weapon mesh.
+	 *
+	 * Deliberately NOT IsLocallyControlled(). An AI-controlled pawn is locally controlled on the authority,
+	 * so every 1P/3P selection in this component would pick the arms nobody can see. Sites that ask "does
+	 * this machine drive the logic" (reload completion, prediction reconcile, the multicast de-dupe) still
+	 * ask IsLocallyControlled() and must keep doing so - the two questions only coincide for human players.
+	 */
+	bool IsOwnerFirstPerson() const;
 
 	/** Ends the owning pawn's sprint. Never affects sliding, jumping or any other movement state. */
 	void CancelOwnerSprint();

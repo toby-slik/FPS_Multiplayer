@@ -306,7 +306,7 @@ void AShooterPlayerController::Input_Look(const FInputActionValue& InputActionVa
 	float LookScale = 1.f;
 	if (const UCombatComponent* Combat = UCombatComponent::FindCombatComponent(GetPawn()); IsValid(Combat) && Combat->bAiming && IsValid(Combat->CurrentWeapon))
 	{
-		LookScale = Combat->CurrentWeapon->AimLookSensitivityScale;
+		LookScale = Combat->CurrentWeapon->GetEffectiveAimLookSensitivityScale();
 	}
 
 	AddYawInput(InputAxisVector.X * LookScale);

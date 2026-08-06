@@ -4,12 +4,15 @@
 #include "Weapon/Weapon.h"
 
 #include "KismetTraceUtils.h"
+#include "Combat/CombatComponent.h"
 #include "Components/SkeletalMeshComponent.h"
+#include "Data/AttachmentData.h"
 #include "FPS/FPS.h"
 #include "GameFramework/Pawn.h"
 #include "Interfaces/PlayerInterface.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "Net/UnrealNetwork.h"
 #include "Tags/ShooterGamePlayTags.h"
 
 
@@ -55,6 +58,17 @@ AWeapon::AWeapon()
 	KickLocationOffset = FVector::ZeroVector;
 	KickRotationOffset = FRotator::ZeroRotator;
 	bKickRestTransformsCached = false;
+}
+
+void AWeapon::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+
+	// Unconditional, not COND_OwnerOnly. Every machine needs this: the owner predicts spread, mag size and
+	// reload timing from it, and a simulated proxy derives the observed weapon's kick from it too. Unlike
+	// bAiming there is nothing for COND_SkipOwner to save either, because equipping is never client-predicted
+	// - the owner learns what it is carrying from here.
+	DOREPLIFETIME(AWeapon, Attachments);
 }
 
 USkeletalMeshComponent* AWeapon::GetMesh1P() const
@@ -129,11 +143,16 @@ void AWeapon::WeaponTrace(FHitResult& OutHit, float TraceLength, float SpreadDeg
 	APawn* InstigatingPawn = GetInstigator();
 	if (!IsValid(InstigatingPawn) || !IsValid(GetWorld())) return;
 
-	if (APlayerController* PC = Cast<APlayerController>(InstigatingPawn->GetController()); IsValid(PC))
+	// AController, not APlayerController. This whole function used to sit inside an APlayerController cast,
+	// which meant an AI-controlled pawn skipped the trace entirely and returned an untouched OutHit - the bot
+	// spent ammo, played its montage and hit nothing, with nothing logged. AController::GetActorEyesViewPoint
+	// resolves to the pawn's own view point, which is the correct aim origin for a bot; APlayerController's
+	// override is what gives a human the camera-accurate one, and that path is unchanged for players.
+	if (AController* ShooterController = InstigatingPawn->GetController(); IsValid(ShooterController))
 	{
 		FVector EyesWorldLocation;
 		FRotator EyesWorldRotation;
-		PC->GetActorEyesViewPoint(EyesWorldLocation, EyesWorldRotation);
+		ShooterController->GetActorEyesViewPoint(EyesWorldLocation, EyesWorldRotation);
 		FVector EyesWorldDirection = UKismetMathLibrary::GetForwardVector(EyesWorldRotation);
 
 		if (SpreadDegrees > 0.f)
@@ -187,7 +206,7 @@ void AWeapon::Local_Fire(const FVector& ImpactPoint, const FVector& ImpactNormal
 	APawn* InstigatingPawn = GetInstigator();
 	if (IsValid(InstigatingPawn) && InstigatingPawn->IsLocallyControlled() && !HasAuthority())
 	{
-		Ammo = FMath::Clamp(Ammo -1, 0, MagCapacity);
+		Ammo = FMath::Clamp(Ammo -1, 0, GetEffectiveMagCapacity());
 		++Sequence;
 	}
 }
@@ -203,7 +222,7 @@ void AWeapon::Local_DryFire(bool bReloadStarted)
 
 void AWeapon::Auth_Fire()
 {
-	Ammo = FMath::Clamp(Ammo -1, 0, MagCapacity);
+	Ammo = FMath::Clamp(Ammo -1, 0, GetEffectiveMagCapacity());
 }
 
 void AWeapon::Rep_Fire(int32 AuthAmmo)
@@ -215,7 +234,7 @@ void AWeapon::Rep_Fire(int32 AuthAmmo)
 		// Clamped because a stale Sequence would otherwise hand back a negative mag (locks out firing)
 		// or one above capacity.
 		Sequence = FMath::Max(Sequence - 1, 0);
-		Ammo = FMath::Clamp(AuthAmmo - Sequence, 0, MagCapacity);
+		Ammo = FMath::Clamp(AuthAmmo - Sequence, 0, GetEffectiveMagCapacity());
 	}
 }
 
@@ -430,7 +449,9 @@ void AWeapon::AddRecoilHeat(float CurrentTime)
 	// Decay is settled before the shot is added so a burst can never bank the cooling it has not had yet.
 	AdvanceAndGetHeat(CurrentTime);
 
-	SpreadHeat = FMath::Clamp(SpreadHeat + FMath::Max(RecoilParams.HeatPerShot, 0.f), 0.f, 1.f);
+	const float HeatThisShot = FMath::Max(RecoilParams.HeatPerShot, 0.f) * FMath::Max(EffectiveStats.RecoilHeatMultiplier, 0.f);
+
+	SpreadHeat = FMath::Clamp(SpreadHeat + HeatThisShot, 0.f, 1.f);
 	LastHeatShotTime = CurrentTime;
 	LastHeatDecayTime = CurrentTime;
 }
@@ -452,9 +473,17 @@ float AWeapon::GetSpreadDegrees(bool bIsAiming, bool bIsMoving, bool bIsAirborne
 		FMath::Max(RecoilParams.SpreadMaxDegrees, 0.f),
 		FMath::Clamp(SpreadHeat, 0.f, 1.f));
 
+	// The two attachment spread terms are stance-exclusive on purpose: a laser sight is the hip-fire answer and
+	// an optic is the ranged answer, so neither can be stacked into a weapon that is accurate in both stances.
+	// That split is the entire "better hip-fire accuracy vs better ranged accuracy" trade-off from the GDD.
 	if (bIsAiming)
 	{
 		Spread *= FMath::Max(RecoilParams.AimSpreadMultiplier, 0.f);
+		Spread *= FMath::Max(EffectiveStats.AimSpreadMultiplier, 0.f);
+	}
+	else
+	{
+		Spread *= FMath::Max(EffectiveStats.HipFireSpreadMultiplier, 0.f);
 	}
 
 	// Airborne supersedes moving rather than compounding with it. A jump is always "moving" as well, and
@@ -483,14 +512,28 @@ float AWeapon::GetViewPunchPitch(bool bIsAiming) const
 		Punch *= FMath::Max(RecoilParams.AimViewPunchMultiplier, 0.f);
 	}
 
-	return Punch;
+	return Punch * FMath::Max(EffectiveStats.ViewPunchMultiplier, 0.f);
+}
+
+float AWeapon::GetViewPunchYawRange(bool bIsAiming) const
+{
+	// Scaled by heat so the first round of a burst goes exactly where it is aimed and only sustained fire
+	// wanders sideways. A cold weapon with any yaw at all makes single-shot weapons feel broken.
+	return FMath::Max(RecoilParams.ViewPunchYawRange, 0.f)
+		* (bIsAiming ? FMath::Max(RecoilParams.AimViewPunchMultiplier, 0.f) : 1.f)
+		* FMath::Max(EffectiveStats.ViewPunchMultiplier, 0.f)
+		* FMath::Clamp(SpreadHeat, 0.f, 1.f);
 }
 
 void AWeapon::ApplyWeaponKick(bool bIsAiming)
 {
 	CacheKickRestTransforms();
 
-	const float AimScale = bIsAiming ? FMath::Max(RecoilParams.AimWeaponKickMultiplier, 0.f) : 1.f;
+	// Folded into the same scalar as the aim multiplier rather than applied afterwards, because the accumulation
+	// ceiling below is derived from these same numbers - scaling the kick without scaling its ceiling would let
+	// a foregrip'd weapon stack more shots' worth of a smaller kick and end up in the same held-back pose.
+	const float AimScale = (bIsAiming ? FMath::Max(RecoilParams.AimWeaponKickMultiplier, 0.f) : 1.f)
+		* FMath::Max(EffectiveStats.WeaponKickMultiplier, 0.f);
 
 	// Drawn from the global RNG on purpose: unlike spread, the visible kick is never re-derived on another
 	// machine, so there is nothing to keep in sync and a shared seed would only make repeat shots identical.
@@ -596,11 +639,203 @@ void AWeapon::BeginPlay()
 	// Before anything can kick, and before the first AttachToOwningPawn - which preserves relative
 	// transforms, so what is captured here stays the correct rest pose for the weapon's whole life.
 	CacheKickRestTransforms();
+
+	// Authority only, and it fills the replicated array rather than a separate one, so a client never applies
+	// these itself - it receives them like any other equipped attachment and cannot disagree about them.
+	if (HasAuthority())
+	{
+		for (UAttachmentData* Definition : DefaultAttachments)
+		{
+			if (!IsValid(Definition)) continue;
+
+			Auth_SetAttachment(Definition, Definition->BaseRarity);
+		}
+	}
+
+	// Also on clients, where initial replication of Attachments can land before BeginPlay and therefore before
+	// OnRep_Attachments is of any use.
+	RecalculateEffectiveStats();
+	RefreshAttachmentVisuals();
+}
+
+bool AWeapon::SupportsSlot(EAttachmentSlot Slot) const
+{
+	if (Slot == EAttachmentSlot::None) return false;
+
+	return SupportedSlots.Contains(Slot);
+}
+
+bool AWeapon::CanEquipAttachment(const UAttachmentData* Definition) const
+{
+	if (!IsValid(Definition)) return false;
+	if (!SupportsSlot(Definition->Slot)) return false;
+	if (!Definition->IsCompatibleWithWeaponType(WeaponType)) return false;
+
+	return true;
+}
+
+FEquippedAttachment AWeapon::GetAttachmentInSlot(EAttachmentSlot Slot) const
+{
+	for (const FEquippedAttachment& Attachment : Attachments)
+	{
+		if (Attachment.Slot == Slot)
+		{
+			return Attachment;
+		}
+	}
+
+	return FEquippedAttachment();
+}
+
+bool AWeapon::Auth_SetAttachment(UAttachmentData* Definition, EAttachmentRarity InstanceRarity)
+{
+	if (!HasAuthority()) return false;
+	if (!CanEquipAttachment(Definition)) return false;
+
+	FEquippedAttachment NewAttachment;
+	NewAttachment.Slot = Definition->Slot;
+	NewAttachment.Definition = Definition;
+	// Clamped up, never down. An instance below its own definition's base rarity would give
+	// GetValueForRaritySteps a negative step count, and a "worse than authored" attachment is not a state the
+	// design has - the reroll only ever rolls up.
+	NewAttachment.Rarity = FMath::Max(InstanceRarity, Definition->BaseRarity);
+
+	// One per slot, so this replaces rather than appends. Index-based rather than remove-then-add so the
+	// array order stays stable across an attachment swap and clients see a single changed entry.
+	bool bReplaced = false;
+	for (FEquippedAttachment& Existing : Attachments)
+	{
+		if (Existing.Slot != NewAttachment.Slot) continue;
+
+		Existing = NewAttachment;
+		bReplaced = true;
+		break;
+	}
+	if (!bReplaced)
+	{
+		Attachments.Add(NewAttachment);
+	}
+
+	RecalculateEffectiveStats();
+	ClampAmmoToEffectiveCapacity();
+	RefreshAttachmentVisuals();
+
+	// The weapon replicates at 5Hz to keep idle inventory cheap, which is fine for state nobody is waiting on
+	// but not for this: the loadout screen and the post-match steal both change attachments at a moment the
+	// player is looking straight at the result.
+	ForceNetUpdate();
+
+	return true;
+}
+
+bool AWeapon::Auth_ClearAttachmentSlot(EAttachmentSlot Slot)
+{
+	if (!HasAuthority()) return false;
+
+	const int32 RemovedCount = Attachments.RemoveAll([Slot](const FEquippedAttachment& Attachment)
+	{
+		return Attachment.Slot == Slot;
+	});
+	if (RemovedCount == 0) return false;
+
+	RecalculateEffectiveStats();
+	ClampAmmoToEffectiveCapacity();
+	RefreshAttachmentVisuals();
+	ForceNetUpdate();
+
+	return true;
+}
+
+int32 AWeapon::GetEffectiveMagCapacity() const
+{
+	// Floored at 1 rather than at 0. A capacity of 0 makes Ammo permanently 0, which reads as a weapon that
+	// silently refuses to fire for the rest of the match with nothing on screen to explain it.
+	return FMath::Max(MagCapacity + EffectiveStats.MagCapacityBonus, 1);
+}
+
+float AWeapon::GetEffectiveAimFieldOfView() const
+{
+	// Clamped to a sane camera range: a modifier stack that reaches 0 or goes negative would otherwise hand
+	// SetFieldOfView a value that renders nothing at all.
+	return FMath::Clamp(AimFieldOfView * FMath::Max(EffectiveStats.AimFieldOfViewMultiplier, 0.f), 5.f, 170.f);
+}
+
+float AWeapon::GetEffectiveAimLookSensitivityScale() const
+{
+	return FMath::Max(AimLookSensitivityScale * FMath::Max(EffectiveStats.AimLookSensitivityMultiplier, 0.f), 0.f);
+}
+
+float AWeapon::GetReloadPlayRate() const
+{
+	// Floored well above 0: a play rate of 0 freezes the montage, and the reload notify that refills the mag
+	// would then never fire, leaving the weapon empty with no way to recover short of a weapon swap.
+	return FMath::Max(EffectiveStats.ReloadSpeedMultiplier, 0.1f);
+}
+
+float AWeapon::GetEquipPlayRate() const
+{
+	// Same trap as the reload rate: the equip montage's blend-out is what hands control back, so a rate of 0
+	// would leave the weapon stuck in EWeaponStatus::Cycling and unable to fire.
+	return FMath::Max(EffectiveStats.EquipSpeedMultiplier, 0.1f);
+}
+
+void AWeapon::OnRep_Attachments()
+{
+	RecalculateEffectiveStats();
+	ClampAmmoToEffectiveCapacity();
+	RefreshAttachmentVisuals();
+
+	// The HUD delegates live on UCombatComponent, and the ammo counter's rounds-max has just changed. Reached
+	// through the component's own static finder rather than by casting the owner, matching how the rest of the
+	// combat code avoids knowing the pawn's class.
+	if (UCombatComponent* Combat = UCombatComponent::FindCombatComponent(GetOwner()); IsValid(Combat))
+	{
+		Combat->NotifyAttachmentsChanged(this);
+	}
+}
+
+void AWeapon::RecalculateEffectiveStats()
+{
+	EffectiveStats.Reset();
+
+	for (const FEquippedAttachment& Attachment : Attachments)
+	{
+		// A replicated reference to a data asset resolves by path, so on a client it can in principle still be
+		// null on the frame the array arrives. Skipped rather than treated as an error: BeginPlay recalculates
+		// as well, and the hard references in DefaultAttachments keep these assets resident in practice.
+		if (!IsValid(Attachment.Definition)) continue;
+
+		const int32 RaritySteps = static_cast<int32>(Attachment.Rarity) - static_cast<int32>(Attachment.Definition->BaseRarity);
+
+		for (const FWeaponStatModifier& Modifier : Attachment.Definition->Modifiers)
+		{
+			EffectiveStats.ApplyModifier(Modifier, RaritySteps);
+		}
+	}
+}
+
+void AWeapon::ClampAmmoToEffectiveCapacity()
+{
+	Ammo = FMath::Min(Ammo, GetEffectiveMagCapacity());
+}
+
+void AWeapon::RefreshAttachmentVisuals_Implementation()
+{
+	// Intentionally empty - see the declaration. Override in the weapon Blueprint alongside FireEffects.
 }
 
 void AWeapon::SetMeshVisibilities(APawn* OwningPawn) const
 {
-	if (OwningPawn->IsLocallyControlled())
+	if (!IsValid(OwningPawn)) return;
+
+	// Player-viewed, not merely locally controlled. A bot is locally controlled on the authority, so the old
+	// test showed its Mesh1P - parented under a bOnlyOwnerSee arms mesh no human owns - and hid its Mesh3P.
+	// The result on a listen-server host was a bot walking around visibly holding nothing.
+	const bool bFirstPerson = OwningPawn->Implements<UPlayerInterface>()
+		? IPlayerInterface::Execute_IsFirstPersonViewer(OwningPawn)
+		: OwningPawn->IsLocallyControlled();
+
+	if (bFirstPerson)
 	{
 		Mesh1P->SetHiddenInGame(false);
 		Mesh3P->SetHiddenInGame(true);

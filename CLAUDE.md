@@ -16,4 +16,6 @@ Some work has dedicated subagents in `.claude/agents/` with the design context a
 in — prefer them over doing the work inline:
 
 - `player-movement` — sprint, slide, jump/wall-jump, movement tuning on `AShooterCharacter`
+- `weapon` — firing, ammo/reload, aiming, recoil, damage and the weapon-facing HUD
+- `enemy-ai` — the AI bot: perception, tactics, aim simulation, and driving the movement tech
 - `level-designer` — level blockout and geometry via the Unreal MCP editor connection

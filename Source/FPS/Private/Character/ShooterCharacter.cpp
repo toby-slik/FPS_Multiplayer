@@ -698,11 +698,21 @@ bool AShooterCharacter::IsAirborne_Implementation() const
 	return IsValid(MoveComp) && !MoveComp->IsMovingOnGround();
 }
 
+bool AShooterCharacter::IsFirstPersonViewer_Implementation() const
+{
+	// IsPlayerControlled() is the whole point of this override - see the note on the interface declaration.
+	// An AI controller is a local controller on the authority, so IsLocallyControlled() alone would claim a
+	// bot is looking through its own eyes and hand it the first-person asset path.
+	return IsLocallyControlled() && IsPlayerControlled();
+}
+
 void AShooterCharacter::AddCameraShake_Implementation(float Amplitude, float Frequency, float Duration,
 	TSubclassOf<UCameraShakeBase> ShakeClass)
 {
 	// The shake is a local cosmetic on the shooter's own view, so it has no business running anywhere else.
-	if (!IsLocallyControlled()) return;
+	// Player-viewed rather than merely locally controlled: a bot has no view to shake, and letting it run
+	// would have it writing FirstPersonCamera's relative rotation for nobody.
+	if (!IsFirstPersonViewer_Implementation()) return;
 
 	if (IsValid(ShakeClass))
 	{
