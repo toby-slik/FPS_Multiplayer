@@ -73,4 +73,70 @@ struct FReticleParams
 	
 	UPROPERTY(BlueprintReadWrite, EditAnywhere)
 	float TargetingPlayerInterpSpeed = 10.f;
+
+	// Hit Marker
+
+	/** Added to the marker's intensity on every server-confirmed hit. Accumulates under auto-fire, so a
+	 *  burst reads brighter than a single round rather than restarting from zero each time. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	float HitMarkerIntensity_Hit = 1.f;
+
+	/** Added on a confirmed kill, on top of HitMarkerIntensity_Hit. Kills should punch harder. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	float HitMarkerIntensity_Lethal = 1.5f;
+
+	/** How quickly the marker's intensity decays back to 0. Lower = the marker lingers longer. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	float HitMarkerInterpSpeed = 6.f;
+
+	/** Upper bound on accumulated intensity, so held auto-fire can't drive the marker arbitrarily bright. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	float HitMarkerIntensityMax = 2.f;
+
+	/** Extra scale the marker is pushed out to at full intensity, snapping back in as it decays. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	float HitMarkerScaleFactor = 0.25f;
+
+	// Hit Marker - painted fallback geometry.
+	// These only drive the C++/Slate-painted marker UShooterReticle falls back to when no
+	// HitMarkerMaterial is assigned. Units are widget-local, so they are resolution and DPI
+	// independent; the numbers below are tuned to read at a 1080p, DPI scale 1 viewport.
+
+	/** Length of each diagonal tick. Raise for a longer, more aggressive marker. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	float HitMarkerTickLength = 7.f;
+
+	/** Line width of each tick. Raise for a heavier, blunter marker; 1.0 reads as a hairline. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	float HitMarkerTickThickness = 2.f;
+
+	/** Distance from screen centre to the inner end of each tick. This is the hole the crosshair reads through. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	float HitMarkerGap = 6.f;
+
+	/** Extra gap added at full intensity and settling back to HitMarkerGap as the marker decays - the outward pop. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	float HitMarkerKick = 4.f;
+
+	/** Tick thickness is multiplied by this at full lethal blend. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	float HitMarkerLethalThicknessMultiplier = 1.6f;
+
+	/** Tick length is multiplied by this at full lethal blend. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	float HitMarkerLethalLengthMultiplier = 1.35f;
+
+	/** Colour of a normal confirmed hit. Water teal, per the HUD palette. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	FLinearColor HitMarkerColor = FLinearColor(0.25f, 0.85f, 0.85f, 1.f);
+
+	/**
+	 * Colour a kill blends toward. A deliberate, approved exception to the world-palette HUD rule - a kill
+	 * is the one moment that should break out of the teal/gold system so it can never be misread as an
+	 * ordinary hit. Not pure (1,0,0): the small green and blue lift puts it at roughly #FF393F once
+	 * encoded, a hot scarlet that keeps apparent brightness against warm travertine and stays clearly
+	 * separated in hue from the teal non-lethal marker, where flat pure red goes muddy.
+	 */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	FLinearColor HitMarkerColor_Lethal = FLinearColor(1.f, 0.04f, 0.05f, 1.f);
 };

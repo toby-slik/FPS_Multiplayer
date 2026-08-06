@@ -31,14 +31,19 @@ bool UHealthComponent::ChangeHealthByAmount(float Amount, AActor* Instigator)
 	float OldValue = Health;
 	Health = FMath::Clamp(Health + Amount, 0.f, MaxHealth);
 	OnHealthChanged.Broadcast(this, OldValue, Health, Instigator);
-	// Check if lethal -> Start Death
-	
+
+	// Lethality is read before StartDeath so the caller can tell "this change killed them" from
+	// "they were already dead" - StartDeath early-returns on the second, which the hit marker needs
+	// to distinguish so a corpse never awards a kill marker.
+	const bool bWasAlive = DeathState == EDeathState::NotDead;
+	const bool bLethal = bWasAlive && Health <= 0.f;
+
 	if (Health <= 0.f)
 	{
 		StartDeath();
 	}
-	
-	return false;
+
+	return bLethal;
 }
 
 void UHealthComponent::StartDeath()

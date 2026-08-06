@@ -72,7 +72,22 @@ public:
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
 	void Notify_ReloadWeapon();
 	
+	/** Applies damage. Returns true only when this damage was the killing blow. */
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
 	bool DoDamage(float DamageAmount, AActor* DamageInstigator);
+
+	/**
+	 * False from the moment death starts, not when the ragdoll settles. Lets the combat component
+	 * skip corpses without reaching into UHealthComponent itself.
+	 */
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
+	bool IsAlive() const;
+
+	/**
+	 * Bones on this target that count as a headshot. The target owns its own anatomy - the weapon only
+	 * owns the multiplier - so a future character with a different skeleton needs no combat-code change.
+	 */
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable)
+	TArray<FName> GetHeadshotBones() const;
 
 };

@@ -71,6 +71,10 @@ AShooterCharacter::AShooterCharacter(const FObjectInitializer& ObjectInitializer
 	bWeaponFirstReplicated = false;
 	RespawnTime = 3.f;
 
+	// PA_Mannequin body names, verified against SKM_Manny's physics asset - these are the bodies a
+	// weapon trace can actually report in Hit.BoneName. A name with no body would silently never hit.
+	HeadshotBones = { FName("head"), FName("neck_02"), FName("neck_01") };
+
 	bSprinting = false;
 	bSliding = false;
 	bWallRunning = false;
@@ -424,13 +428,25 @@ void AShooterCharacter::Notify_ReloadWeapon_Implementation()
 bool AShooterCharacter::DoDamage_Implementation(float DamageAmount, AActor* DamageInstigator)
 {
 	if (!IsValid(Health)) return false;
-	
-	Health->ChangeHealthByAmount(-DamageAmount, DamageInstigator);
-	
+
+	const bool bLethal = Health->ChangeHealthByAmount(-DamageAmount, DamageInstigator);
+
 	const int32 MontageSelection = FMath::RandRange(0, HitReacts.Num() - 1);
 	Multicast_HitReact(MontageSelection);
-	
-	return false;
+
+	return bLethal;
+}
+
+bool AShooterCharacter::IsAlive_Implementation() const
+{
+	if (!IsValid(Health)) return false;
+
+	return Health->DeathState == EDeathState::NotDead;
+}
+
+TArray<FName> AShooterCharacter::GetHeadshotBones_Implementation() const
+{
+	return HeadshotBones;
 }
 
 void AShooterCharacter::Multicast_HitReact_Implementation(int32 MontageIndex)

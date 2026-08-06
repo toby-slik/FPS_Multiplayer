@@ -52,6 +52,8 @@ public:
 	virtual void Notify_CycleWeapon_Implementation() override;
 	virtual void Notify_ReloadWeapon_Implementation() override;
 	virtual bool DoDamage_Implementation(float DamageAmount, AActor* DamageInstigator) override;
+	virtual bool IsAlive_Implementation() const override;
+	virtual TArray<FName> GetHeadshotBones_Implementation() const override;
 	/** ~PlayerInterface */
 
 	virtual void BeginPlay() override;
@@ -82,6 +84,16 @@ public:
 	
 	UPROPERTY(EditDefaultsOnly, Category = "FPS|HitReact")
 	TArray<TObjectPtr<UAnimMontage>> HitReacts;
+
+	/**
+	 * Bones whose physics bodies count as a headshot, on SKM_Manny / PA_Mannequin.
+	 * "head" alone leaves a dead band under the chin: the head capsule only covers the skull, and the
+	 * neck bodies fill everything between it and spine_05, so a visually perfect throat shot would pay
+	 * body damage. Both neck bones are included for that reason. Remove neck_01 here if the lower neck
+	 * ends up feeling too generous - it sits close to the collarbone.
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "FPS|Damage")
+	TArray<FName> HeadshotBones;
 	
 	UPROPERTY(EditDefaultsOnly, Category = "FPS|Respawn")
 	float RespawnTime;

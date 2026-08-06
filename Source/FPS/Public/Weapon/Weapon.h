@@ -71,7 +71,15 @@ public:
 	
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "FPS|Damage")
 	float Damage;
-	
+
+	/**
+	 * Damage is multiplied by this when the round lands on one of the target's headshot bones.
+	 * Per weapon on purpose: a high multiplier is meant to be paid for elsewhere (smaller mag, worse
+	 * hip-fire, slower swap) rather than being a free global rule. 1.0 disables headshots for a weapon.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "FPS|Damage")
+	float HeadshotDamageMultiplier;
+
 	UPROPERTY(EditDefaultsOnly, Category= "FPS|Reticle")
 	FReticleParams ReticleParams;
 	

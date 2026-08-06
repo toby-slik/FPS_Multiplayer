@@ -19,6 +19,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FRoundFired, int32, RoundsCurrent
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAimingStatusChanged, bool, bIsAiming);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FTargetingPlayerStatusChanged, bool, bIsAiming);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FCurrentReserveAmmoChanged, int32, RoundsInReserve, int32, RoundsInWeapon, UMaterialInterface*, WeaponIconMaterial);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FHitConfirmed, bool, bLethal, bool, bHeadshot, float, DamageDealt);
 
 UCLASS(ClassGroup=(Custom), meta=(BlueprintSpawnableComponent))
 class FPS_API UCombatComponent : public UActorComponent
@@ -61,6 +62,10 @@ public:
 	
 	UPROPERTY(BlueprintAssignable)
 	FCurrentReserveAmmoChanged OnCurrentReserveAmmoChanged;
+
+	/** Fired on the shooting client only, once the server has confirmed the round landed on a player. */
+	UPROPERTY(BlueprintAssignable)
+	FHitConfirmed OnHitConfirmed;
 	
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|Weapon")
 	TObjectPtr<UWeaponData> WeaponData;
@@ -149,6 +154,46 @@ private:
 
 	UFUNCTION(Client, Reliable)
 	void Client_ReloadWeapon(int32 NewWeaponAmmo, int32 NewCarriedAmmo);
+
+	/**
+	 * Tells the shooter its round landed. Deliberately Unreliable: the hit marker is purely cosmetic,
+	 * and at auto-fire rates a reliable per-shot RPC saturates the reliable buffer and can drop clients.
+	 * A missed marker costs one frame of feedback; a full buffer costs the connection.
+	 */
+	UFUNCTION(Client, Unreliable)
+	void Client_ConfirmHit(bool bLethal, bool bHeadshot, float DamageDealt);
+
+	/**
+	 * Authority-only. True when Hit names one of the target's headshot bones AND the claim survives
+	 * Auth_ValidateHeadshot. Never call this on a client - the result is what scales damage.
+	 */
+	bool Auth_IsHeadshot(const FHitResult& Hit) const;
+
+	/**
+	 * Cheap sanity gate on a client-supplied Hit.BoneName. Server_FireWeapon trusts the client's
+	 * FHitResult wholesale (there is no server-side rewind yet), so a damage multiplier keyed on
+	 * BoneName is directly forgeable. This confirms the named bone actually exists on the target's mesh
+	 * and that Hit.ImpactPoint is within HeadshotValidationTolerance of that bone's current
+	 * server-side position. On failure only the multiplier is dropped, never the shot - honest clients
+	 * fail this from ordinary latency and a swallowed hit feels far worse than a swallowed headshot.
+	 */
+	bool Auth_ValidateHeadshot(const FHitResult& Hit, FName BoneName) const;
+
+	/**
+	 * Distance Hit.ImpactPoint may sit from the claimed bone's server-side world position and still count.
+	 * Defaults deliberately loose: the server has no rewind, so at high ping the target has genuinely
+	 * moved between the client's trace and this check. Tighten only if forged headshots become a problem.
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "FPS|Damage")
+	float HeadshotValidationTolerance;
+
+	/**
+	 * Turn off if headshots stop registering on a dedicated server: the 3P mesh may not tick its pose
+	 * there, leaving bone transforms stale, which makes every position check fail. Turning it off means
+	 * the server takes the client's claimed bone on trust.
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "FPS|Damage")
+	bool bValidateHeadshotBonePosition;
 
 	UFUNCTION(NetMulticast, Reliable)
 	void Multicast_ReloadWeapon();

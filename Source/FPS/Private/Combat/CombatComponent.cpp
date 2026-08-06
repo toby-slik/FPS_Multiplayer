@@ -24,6 +24,8 @@ UCombatComponent::UCombatComponent()
 	bAiming = false;
 	bTriggerPressed = false;
 	Local_WeaponIndex = 0;
+	HeadshotValidationTolerance = 120.f;
+	bValidateHeadshotBonePosition = true;
 }
 
 
@@ -169,6 +171,50 @@ void UCombatComponent::Client_ReloadWeapon_Implementation(int32 NewWeaponAmmo, i
 			Local_FireWeapon();
 		}
 	}
+}
+
+void UCombatComponent::Client_ConfirmHit_Implementation(bool bLethal, bool bHeadshot, float DamageDealt)
+{
+	// bHeadshot is carried but currently unused by the HUD - the hit marker's headshot look is still an
+	// open art decision. It is plumbed now so adding the visual is a widget-only change later.
+	OnHitConfirmed.Broadcast(bLethal, bHeadshot, DamageDealt);
+}
+
+bool UCombatComponent::Auth_IsHeadshot(const FHitResult& Hit) const
+{
+	if (!IsValid(CurrentWeapon)) return false;
+	if (Hit.BoneName.IsNone()) return false;
+
+	// A weapon can opt out of headshots entirely with a multiplier of 1, and there is no point paying
+	// for the validation trace-back in that case.
+	if (CurrentWeapon->HeadshotDamageMultiplier <= 1.f) return false;
+
+	AActor* Target = Hit.GetActor();
+	if (!IsValid(Target)) return false;
+
+	const TArray<FName> HeadshotBones = IPlayerInterface::Execute_GetHeadshotBones(Target);
+	if (!HeadshotBones.Contains(Hit.BoneName)) return false;
+
+	return Auth_ValidateHeadshot(Hit, Hit.BoneName);
+}
+
+bool UCombatComponent::Auth_ValidateHeadshot(const FHitResult& Hit, FName BoneName) const
+{
+	if (!bValidateHeadshotBonePosition) return true;
+
+	AActor* Target = Hit.GetActor();
+	if (!IsValid(Target)) return false;
+
+	USkeletalMeshComponent* TargetMesh = IPlayerInterface::Execute_GetMesh3P(Target);
+	if (!IsValid(TargetMesh)) return false;
+
+	// Rejecting an unknown bone outright is the one hard check here: a name the skeleton does not have
+	// can only come from a forged FHitResult, never from latency.
+	if (TargetMesh->GetBoneIndex(BoneName) == INDEX_NONE) return false;
+
+	const FVector BoneLocation = TargetMesh->GetBoneLocation(BoneName, EBoneSpaces::WorldSpace);
+
+	return FVector::DistSquared(Hit.ImpactPoint, BoneLocation) <= FMath::Square(HeadshotValidationTolerance);
 }
 
 void UCombatComponent::BlendOut_CycleWeapon(UAnimMontage* Montage, bool bInterrupted)
@@ -356,7 +402,27 @@ void UCombatComponent::Server_FireWeapon_Implementation(const FHitResult& Hit)
 
 	if (IsValid(Hit.GetActor()) && Hit.GetActor()->Implements<UPlayerInterface>())
 	{
-		IPlayerInterface::Execute_DoDamage(Hit.GetActor(), CurrentWeapon->Damage, GetOwner());
+		// A dead pawn keeps its capsule until the respawn, so without this gate rounds fired into a
+		// corpse still ran damage and would light up the hit marker. Asked through the interface
+		// rather than by finding the target's UHealthComponent, matching how the rest of this
+		// component reaches the pawn.
+		if (IPlayerInterface::Execute_IsAlive(Hit.GetActor()))
+		{
+			// The multiplier is resolved here rather than inside DoDamage so the target never has to know
+			// anything about weapon stats - it is handed a final number. It is also authority-only by
+			// construction: Local_FireWeapon does not scale damage at all, so a client cannot pre-apply it.
+			const bool bHeadshot = Auth_IsHeadshot(Hit);
+			const float DamageToApply = bHeadshot ? CurrentWeapon->Damage * CurrentWeapon->HeadshotDamageMultiplier : CurrentWeapon->Damage;
+
+			const bool bLethal = IPlayerInterface::Execute_DoDamage(Hit.GetActor(), DamageToApply, GetOwner());
+
+			// Confirmation comes from the authoritative trace result, not the client's own trace in
+			// Local_FireWeapon - the two can disagree, and a false-positive marker reads far worse
+			// than one that arrives a round trip late.
+			// On a listen-server host this is a Client_ RPC on a locally controlled authority pawn,
+			// so it simply executes locally. No separate host path is needed.
+			Client_ConfirmHit(bLethal, bHeadshot, DamageToApply);
+		}
 	}
 
 	// A locally controlled authority pawn already spent its round in Local_Fire.

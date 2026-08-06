@@ -7,6 +7,13 @@
 #include "Combat/CombatComponent.h"
 #include "Components/Image.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "Rendering/DrawElements.h"
+
+namespace HitMarkerPaint
+{
+	/** Below this accumulated intensity the marker is invisible, so we skip the draw entirely. */
+	constexpr float VisibilityThreshold = 0.01f;
+}
 
 namespace  Ammo
 {
@@ -21,6 +28,13 @@ namespace Reticle
 	const FName Inner_RGBA = FName("Inner_RGBA");
 }
 
+namespace HitMarker
+{
+	const FName Intensity = FName("Intensity");
+	const FName LethalBlend = FName("LethalBlend");
+	const FName Scale = FName("Scale");
+}
+
 
 void UShooterReticle::NativeOnInitialized()
 {
@@ -31,9 +45,14 @@ void UShooterReticle::NativeOnInitialized()
 	_BaseShapeCutFactor_RoundFired = 0.f;
 	_BaseCornerScaleFactor_Aiming = 0.f;
 	_BaseShapeCutFactor_Aiming = 0.f;
+	_HitMarkerIntensity = 0.f;
+	_HitMarkerLethal = 0.f;
+	_bHitMarkerLethalLatched = false;
 	bAiming = false;
 	bTargetingPlayer = false;
-	
+
+	SetupHitMarker();
+
 	GetOwningPlayer()->OnPossessedPawnChanged.AddDynamic(this, &ThisClass::OnPossesedPawnChanged);
 	
 	AShooterCharacter* ShooterCharacter = Cast<AShooterCharacter>(GetOwningPlayer()->GetPawn());
@@ -63,6 +82,27 @@ void UShooterReticle::NativeOnInitialized()
 	}
 }
 
+void UShooterReticle::SetupHitMarker()
+{
+	if (!IsValid(Image_HitMarker)) return;
+	if (!IsValid(HitMarkerMaterial))
+	{
+		// No art assigned yet - keep the image dark rather than showing an unset white brush.
+		Image_HitMarker->SetRenderOpacity(0.f);
+		return;
+	}
+
+	HitMarker_DynMatInst = UMaterialInstanceDynamic::Create(HitMarkerMaterial, this);
+
+	FSlateBrush Brush;
+	Brush.SetResourceObject(HitMarker_DynMatInst);
+	Image_HitMarker->SetBrush(Brush);
+
+	// The marker is always drawn; visibility is entirely the Intensity param's job. Toggling Slate
+	// visibility per shot would rebuild the layout on every round under auto-fire.
+	Image_HitMarker->SetRenderOpacity(1.f);
+}
+
 void UShooterReticle::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
 {
 	Super::NativeTick(MyGeometry, InDeltaTime);
@@ -83,6 +123,95 @@ void UShooterReticle::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
 		CurrentReticle_DynMatInst->SetScalarParameterValue(Reticle::RoundedCornerScale, BaseCornerScaleFactor);
 		CurrentReticle_DynMatInst->SetScalarParameterValue(Reticle::ShapeCutThickness, BaseShapeCutFactor);
 	}
+
+	// Same accumulate-then-decay shape as _BaseCornerScaleFactor_RoundFired: a fresh hit adds to the
+	// intensity instead of restarting an animation, which is what keeps it readable under auto-fire.
+	_HitMarkerIntensity = FMath::FInterpTo(_HitMarkerIntensity, 0.f, InDeltaTime, CurrentReticleParams.HitMarkerInterpSpeed);
+
+	// Lethal is a LATCHED state, not an independent decay. Decaying it on its own faster speed meant a
+	// kill was only red for the first ~0.1s of a marker that stays visible for ~0.9s - a few frames out
+	// of the whole life, which reads as "the kill marker is teal". So it ramps in and then holds until
+	// the marker itself has faded out. A non-lethal hit can never land during that hold anyway: the
+	// target is dead, and Server_FireWeapon's IsAlive gate drops rounds fired into a corpse.
+	if (_bHitMarkerLethalLatched && _HitMarkerIntensity <= HitMarkerPaint::VisibilityThreshold)
+	{
+		_HitMarkerLethal = 0.f;
+		_bHitMarkerLethalLatched = false;
+	}
+
+	if (IsValid(HitMarker_DynMatInst))
+	{
+		HitMarker_DynMatInst->SetScalarParameterValue(HitMarker::Intensity, _HitMarkerIntensity);
+		HitMarker_DynMatInst->SetScalarParameterValue(HitMarker::LethalBlend, _HitMarkerLethal);
+		HitMarker_DynMatInst->SetScalarParameterValue(HitMarker::Scale, 1.f + _HitMarkerIntensity * CurrentReticleParams.HitMarkerScaleFactor);
+	}
+}
+
+bool UShooterReticle::ShouldPaintHitMarker() const
+{
+	// HitMarker_DynMatInst is only ever created when both the image and the material exist, so its
+	// validity is the single authoritative "the material path is live" test.
+	return !(IsValid(Image_HitMarker) && IsValid(HitMarker_DynMatInst));
+}
+
+int32 UShooterReticle::NativePaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const
+{
+	// Super first so the reticle and ammo counter images draw, then the marker goes on the layer above
+	// whatever they ended up on - otherwise the reticle can occlude it.
+	const int32 MaxLayer = Super::NativePaint(Args, AllottedGeometry, MyCullingRect, OutDrawElements, LayerId, InWidgetStyle, bParentEnabled);
+
+	if (!ShouldPaintHitMarker()) return MaxLayer;
+	if (_HitMarkerIntensity <= HitMarkerPaint::VisibilityThreshold) return MaxLayer;
+
+	return PaintHitMarker(AllottedGeometry, OutDrawElements, MaxLayer + 1);
+}
+
+int32 UShooterReticle::PaintHitMarker(const FGeometry& AllottedGeometry, FSlateWindowElementList& OutDrawElements, int32 LayerId) const
+{
+	// Centre is derived from the geometry rather than hard-coded pixels so the marker stays centred at
+	// any resolution, and the local-space units below are pre-DPI, so it scales with the rest of the HUD.
+	const FVector2D LocalSize = FVector2D(AllottedGeometry.GetLocalSize());
+	const FVector2D Centre = LocalSize * 0.5f;
+
+	const float Alpha = FMath::Clamp(_HitMarkerIntensity, 0.f, 1.f);
+	const float Lethal = FMath::Clamp(_HitMarkerLethal, 0.f, 1.f);
+
+	// Lethal is latched for the marker's whole visible life, so a kill is red from its first frame to
+	// its last and never crossfades back to teal while still on screen.
+	FLinearColor Colour = FMath::Lerp(CurrentReticleParams.HitMarkerColor, CurrentReticleParams.HitMarkerColor_Lethal, Lethal);
+	Colour.A *= Alpha;
+
+	const float Thickness = CurrentReticleParams.HitMarkerTickThickness * FMath::Lerp(1.f, CurrentReticleParams.HitMarkerLethalThicknessMultiplier, Lethal);
+	const float Length = CurrentReticleParams.HitMarkerTickLength * FMath::Lerp(1.f, CurrentReticleParams.HitMarkerLethalLengthMultiplier, Lethal);
+	const float InnerRadius = CurrentReticleParams.HitMarkerGap + CurrentReticleParams.HitMarkerKick * Alpha;
+
+	// Diagonals only. The existing reticle uses cardinal-facing shapes, so the marker sits in the gaps
+	// between them instead of overlapping them, and the centre stays clear for the crosshair.
+	static const FVector2D Diagonals[4] =
+	{
+		FVector2D(-1.f, -1.f),
+		FVector2D( 1.f, -1.f),
+		FVector2D(-1.f,  1.f),
+		FVector2D( 1.f,  1.f)
+	};
+
+	const FPaintGeometry PaintGeometry = AllottedGeometry.ToPaintGeometry();
+
+	for (const FVector2D& Diagonal : Diagonals)
+	{
+		const FVector2D Direction = Diagonal.GetSafeNormal();
+
+		TArray<FVector2D> Points;
+		Points.Reserve(2);
+		Points.Add(Centre + Direction * InnerRadius);
+		Points.Add(Centre + Direction * (InnerRadius + Length));
+
+		// One MakeLines call per tick - a single call would join all four points into one polyline.
+		// NoPixelSnapping keeps the outward kick smooth instead of stepping a pixel at a time.
+		FSlateDrawElement::MakeLines(OutDrawElements, LayerId, PaintGeometry, Points, ESlateDrawEffect::NoPixelSnapping, Colour, true, Thickness);
+	}
+
+	return LayerId;
 }
 
 void UShooterReticle::OnPossesedPawnChanged(APawn* OldPawn, APawn* NewPawn)
@@ -95,6 +224,7 @@ void UShooterReticle::OnPossesedPawnChanged(APawn* OldPawn, APawn* NewPawn)
 		OldPawnCombat->OnRoundFired.RemoveDynamic(this, &ThisClass::OnRoundFired);
 		OldPawnCombat->OnAimingStatusChanged.RemoveDynamic(this, &ThisClass::OnAimingStatusChanged);
 		OldPawnCombat->OnTargetingPlayerStatusChanged.RemoveDynamic(this, &ThisClass::OnTargetingPlayerStatusChanged);
+		OldPawnCombat->OnHitConfirmed.RemoveDynamic(this, &ThisClass::OnHitConfirmed);
 	}
 	UCombatComponent* NewPawnCombat = UCombatComponent::FindCombatComponent(NewPawn);
 	if (IsValid(NewPawnCombat))
@@ -106,6 +236,12 @@ void UShooterReticle::OnPossesedPawnChanged(APawn* OldPawn, APawn* NewPawn)
 		NewPawnCombat->OnRoundFired.AddDynamic(this, &ThisClass::OnRoundFired);
 		NewPawnCombat->OnAimingStatusChanged.AddDynamic(this, &ThisClass::OnAimingStatusChanged);
 		NewPawnCombat->OnTargetingPlayerStatusChanged.AddDynamic(this, &ThisClass::OnTargetingPlayerStatusChanged);
+		NewPawnCombat->OnHitConfirmed.AddDynamic(this, &ThisClass::OnHitConfirmed);
+
+		// The old pawn's marker state must not carry across a respawn.
+		_HitMarkerIntensity = 0.f;
+		_HitMarkerLethal = 0.f;
+		_bHitMarkerLethalLatched = false;
 	}
 }
 
@@ -161,6 +297,27 @@ void UShooterReticle::OnRoundFired(int32 RoundsCurrent, int32 RoundsMax, int32 R
 void UShooterReticle::OnAimingStatusChanged(bool bIsAiming)
 {
 	bAiming =bIsAiming;
+}
+
+void UShooterReticle::OnHitConfirmed(bool bLethal, bool bHeadshot, float DamageDealt)
+{
+	// bHeadshot is intentionally not used yet - the headshot marker look has not been decided. Reading it
+	// here is the only change needed once it is.
+	_HitMarkerIntensity += CurrentReticleParams.HitMarkerIntensity_Hit;
+
+	if (bLethal)
+	{
+		_HitMarkerIntensity += CurrentReticleParams.HitMarkerIntensity_Lethal;
+
+		// Snapped straight to full rather than crossfaded in - a kill confirmation wants to be
+		// unmistakable on the first frame it appears. NativeTick holds it here until the fade completes.
+		_HitMarkerLethal = 1.f;
+		_bHitMarkerLethalLatched = true;
+	}
+
+	// Held auto-fire on a target would otherwise drive the intensity up without bound, so the marker
+	// would still be blooming seconds after the last round landed.
+	_HitMarkerIntensity = FMath::Min(_HitMarkerIntensity, CurrentReticleParams.HitMarkerIntensityMax);
 }
 
 void UShooterReticle::OnTargetingPlayerStatusChanged(bool bTargeting)

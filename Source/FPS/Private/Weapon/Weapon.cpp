@@ -42,6 +42,7 @@ AWeapon::AWeapon()
 	Sequence = 0;
 	WeaponStatus = EWeaponStatus::Unequipped;
 	Damage = 15.f;
+	HeadshotDamageMultiplier = 2.f;
 }
 
 USkeletalMeshComponent* AWeapon::GetMesh1P() const
