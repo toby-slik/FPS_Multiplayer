@@ -3,9 +3,11 @@
 
 #include "AI/ShooterAIAimComponent.h"
 
+#include "AI/ShooterAIBlackboard.h"
 #include "AI/ShooterAIController.h"
 #include "Character/ShooterCharacter.h"
 #include "Combat/CombatComponent.h"
+#include "DrawDebugHelpers.h"
 #include "Engine/World.h"
 #include "Weapon/Weapon.h"
 
@@ -18,20 +20,38 @@ UShooterAIAimComponent::UShooterAIAimComponent()
 	ViewPunchScale = 1.f;
 	ViewPunchRecoveryDegreesPerSecond = 9.f;
 
+	// Tightened from 75. At 75 the bot could legally swing three quarters of a right angle off a player it was
+	// mid-duel with in order to line up a wall run, which was the largest single contributor to "it stops
+	// looking at me". Wall runs are now confined to travel that is broadly toward the target anyway.
+	TraverseMaxLookAwayDegrees = 50.f;
+	TraverseMaxLookAwayTime = 1.6f;
+	TraverseTurnRateMultiplier = 2.5f;
+
+	AimState = EShooterAimState::Search;
+
 	TrackedTime = 0.f;
 	ErrorRefreshTimer = 0.f;
 	CurrentErrorDegrees = FVector2D::ZeroVector;
 	TargetErrorDegrees = FVector2D::ZeroVector;
+	DebugErrorScale = 1.f;
+
 	AccumulatedPunchPitch = 0.f;
+
 	bTriggerHeld = false;
+	bBurstActive = false;
 	bResting = false;
 	BurstTimer = 0.f;
 	AmmoAtLastCheck = -1;
+
+	bFireSuppressed = false;
 	bAimingDownSights = false;
-	bYawLocked = false;
-	LockedTravelDirection = FVector::ZeroVector;
-	DebugAimPoint = FVector::ZeroVector;
-	bBurstActive = false;
+
+	bTravelYawClaimed = false;
+	bTravelYawRenewedThisFrame = false;
+	ClaimedTravelDirection = FVector::ZeroVector;
+	TravelYawClaimElapsed = 0.f;
+
+	DebugLookPoint = FVector::ZeroVector;
 }
 
 AShooterAIController* UShooterAIAimComponent::GetAIController() const
@@ -43,6 +63,12 @@ AShooterCharacter* UShooterAIAimComponent::GetShooterPawn() const
 {
 	const AShooterAIController* AI = GetAIController();
 	return IsValid(AI) ? AI->GetShooterPawn() : nullptr;
+}
+
+UShooterAIBlackboard* UShooterAIAimComponent::GetBlackboard() const
+{
+	const AShooterAIController* AI = GetAIController();
+	return IsValid(AI) ? AI->GetKnowledge() : nullptr;
 }
 
 UCombatComponent* UShooterAIAimComponent::GetCombat() const
@@ -66,64 +92,162 @@ void UShooterAIAimComponent::TickAim(float DeltaTime)
 	// control, and instant recovery would mean it has none.
 	AccumulatedPunchPitch = FMath::Max(0.f, AccumulatedPunchPitch - ViewPunchRecoveryDegreesPerSecond * DeltaTime);
 
+	UpdateAimState(DeltaTime);
 	UpdateAimError(DeltaTime);
 
-	FVector AimPoint;
-	const bool bHaveAimPoint = ComputeAimPoint(AimPoint);
-	DebugAimPoint = bHaveAimPoint ? AimPoint : FVector::ZeroVector;
+	FVector LookPoint;
+	const bool bHaveLookPoint = ComputeLookPoint(LookPoint);
+	DebugLookPoint = bHaveLookPoint ? LookPoint : FVector::ZeroVector;
 
-	UpdateRotation(DeltaTime, AimPoint, bHaveAimPoint);
+	UpdateRotation(DeltaTime, LookPoint, bHaveLookPoint);
 	UpdateAimDownSights();
 	UpdateTrigger(DeltaTime);
+
+	// The claim expires unless locomotion asked for it again this frame. Renewal is the whole handshake: a
+	// movement layer that dies, resets or simply stops wanting the yaw cannot leave the bot facing away.
+	if (!bTravelYawRenewedThisFrame)
+	{
+		ReleaseTravelYawClaim();
+	}
+	bTravelYawRenewedThisFrame = false;
 }
 
-bool UShooterAIAimComponent::ComputeAimPoint(FVector& OutAimPoint)
+/* --- Aim state --- */
+
+void UShooterAIAimComponent::UpdateAimState(float DeltaTime)
+{
+	const UShooterAIBlackboard* BB = GetBlackboard();
+	const bool bTargetLive = IsValid(BB) && BB->IsTargetLive();
+
+	if (bTravelYawClaimed)
+	{
+		TravelYawClaimElapsed += DeltaTime;
+		AimState = EShooterAimState::Traverse;
+		return;
+	}
+
+	// One input, and only one: does the bot have something worth looking at. Nothing about which tactical
+	// action is running reaches this decision, which is what guarantees the bot's view stays on a live
+	// target through a retreat, a reposition or a strafe.
+	AimState = bTargetLive ? EShooterAimState::Track : EShooterAimState::Search;
+}
+
+/* --- Yaw claim --- */
+
+bool UShooterAIAimComponent::RequestTravelYawClaim(const FVector& TravelDirection, bool bForce)
+{
+	const FVector Direction = TravelDirection.GetSafeNormal2D();
+	if (Direction.IsNearlyZero())
+	{
+		ReleaseTravelYawClaim();
+		return false;
+	}
+
+	const AShooterAIController* AI = GetAIController();
+	const UShooterAIBlackboard* BB = GetBlackboard();
+	if (!IsValid(AI) || !IsValid(BB))
+	{
+		ReleaseTravelYawClaim();
+		return false;
+	}
+
+	if (!bForce && BB->IsTargetLive())
+	{
+		// Hard cap on how long the bot may be looking anywhere but at a live opponent.
+		if (bTravelYawClaimed && TravelYawClaimElapsed >= TraverseMaxLookAwayTime)
+		{
+			ReleaseTravelYawClaim();
+			return false;
+		}
+
+		// And a hard cap on how far. Measured against the last known position rather than the live one so a
+		// target that ducks behind cover mid-claim does not instantly revoke it.
+		const FVector ToTarget = (BB->GetLastKnownTargetEyeLocation() - AI->GetEyeLocation()).GetSafeNormal2D();
+		if (!ToTarget.IsNearlyZero())
+		{
+			const float CosLimit = FMath::Cos(FMath::DegreesToRadians(FMath::Clamp(TraverseMaxLookAwayDegrees, 0.f, 180.f)));
+			if ((ToTarget | Direction) < CosLimit)
+			{
+				ReleaseTravelYawClaim();
+				return false;
+			}
+		}
+	}
+
+	if (!bTravelYawClaimed)
+	{
+		TravelYawClaimElapsed = 0.f;
+	}
+
+	bTravelYawClaimed = true;
+	bTravelYawRenewedThisFrame = true;
+	ClaimedTravelDirection = Direction;
+	return true;
+}
+
+void UShooterAIAimComponent::ReleaseTravelYawClaim()
+{
+	bTravelYawClaimed = false;
+	TravelYawClaimElapsed = 0.f;
+	ClaimedTravelDirection = FVector::ZeroVector;
+}
+
+bool UShooterAIAimComponent::IsTravelYawAligned(float DotThreshold) const
+{
+	if (!bTravelYawClaimed) return false;
+
+	const AShooterCharacter* Bot = GetShooterPawn();
+	if (!IsValid(Bot)) return false;
+
+	// The capsule's forward vector, not the control rotation's - that is the vector
+	// UShooterMovementComponent::TryStartWallRun actually tests movement input against.
+	const FVector Forward = Bot->GetActorForwardVector().GetSafeNormal2D();
+	if (Forward.IsNearlyZero()) return false;
+
+	return (Forward | ClaimedTravelDirection) >= DotThreshold;
+}
+
+/* --- Look point --- */
+
+bool UShooterAIAimComponent::ComputeLookPoint(FVector& OutLookPoint) const
 {
 	const AShooterAIController* AI = GetAIController();
-	if (!IsValid(AI)) return false;
-
-	const APawn* Target = AI->GetTargetPawn();
-	if (!IsValid(Target)) return false;
+	const UShooterAIBlackboard* BB = GetBlackboard();
+	if (!IsValid(AI) || !IsValid(BB)) return false;
 
 	const FShooterBotDifficulty& D = AI->GetDifficulty();
 
-	if (AI->HasLineOfSight())
+	// --- A live target outranks everything. This single ordering is the whole "never turn your view away"
+	// rule; it holds in every tactical action because no tactical action is consulted here.
+	if (BB->IsTargetLive())
 	{
-		const FVector TargetEye = Target->GetPawnViewLocation();
-		const FVector TargetVelocity = Target->GetVelocity();
+		if (BB->HasRawLineOfSight())
+		{
+			// The bot aims at where the target *was*, and TargetLeadFraction is how well it compensates for
+			// its own staleness. Fraction 0 leaves the full lag in, so a strafing player is chronically
+			// under-led; 1 cancels it exactly; above 1 over-leads. Expressing both tracking lag and leading
+			// skill through one term is what keeps them from fighting each other - two independent offsets
+			// would let a bot with poor leading still track perfectly, which is not a thing a human hand does.
+			const float EffectiveLag = D.AimTrackingLag * (1.f - D.TargetLeadFraction);
+			OutLookPoint = BB->GetPredictedTargetEyeLocation(-EffectiveLag);
+			return true;
+		}
 
-		// The bot aims at where the target *was*, and TargetLeadFraction is how well it compensates for its
-		// own staleness. Fraction 0 leaves the full lag in, so a strafing player is chronically under-led;
-		// 1 cancels it exactly; above 1 over-leads and the bot shoots in front of the player. Expressing both
-		// tracking lag and leading skill through one term is what keeps them from fighting each other - two
-		// independent offsets would let a bot with poor leading still track perfectly, which is not a thing
-		// a human hand does.
-		const float EffectiveLag = D.AimTrackingLag * (1.f - D.TargetLeadFraction);
-		OutAimPoint = TargetEye - TargetVelocity * EffectiveLag;
+		// Seen recently but not right now. Keep the gun on the remembered position: the trigger refuses to
+		// fire without line of sight, so this cannot become shooting through a wall, and it is what makes the
+		// bot re-acquire instantly when the player steps back out.
+		OutLookPoint = BB->GetLastKnownTargetEyeLocation();
 		return true;
 	}
 
-	// No sight, but the target was seen recently enough for the remembered position to still mean something -
-	// keep the gun pointed at it rather than letting the aim drift. The trigger logic refuses to fire without
-	// line of sight, so this cannot become shooting through a wall.
-	//
-	// Gated on TargetMemoryTime, not merely on being in Hunt: the hunt is now open-ended (a 1v1 bot never
-	// gives up), so without the freshness test a long search would leave the bot staring at a position the
-	// player left a minute ago while it walked past them.
-	if (AI->GetBotState() == EShooterBotState::Hunt && AI->GetTimeSinceLineOfSight() <= D.TargetMemoryTime)
-	{
-		OutAimPoint = AI->GetLastKnownTargetLocation();
-		return true;
-	}
-
-	// Nothing worth aiming at. Look where it is going, so a searching bot faces along its route instead of
-	// walking sideways with a frozen aim - and so it sees the player when it rounds a corner.
-	if (const APawn* Bot = AI->GetShooterPawn())
+	// --- Search. Nothing worth aiming at, so look where the bot is going - it should see what it is walking
+	// into, and it should be facing the right way when it rounds a corner.
+	if (const AShooterCharacter* Bot = AI->GetShooterPawn())
 	{
 		const FVector Travel = Bot->GetVelocity().GetSafeNormal2D();
 		if (!Travel.IsNearlyZero())
 		{
-			OutAimPoint = AI->GetEyeLocation() + Travel * 1000.f;
+			OutLookPoint = AI->GetEyeLocation() + Travel * 1000.f;
 			return true;
 		}
 	}
@@ -131,17 +255,20 @@ bool UShooterAIAimComponent::ComputeAimPoint(FVector& OutAimPoint)
 	return false;
 }
 
+/* --- Aim error --- */
+
 void UShooterAIAimComponent::UpdateAimError(float DeltaTime)
 {
 	const AShooterAIController* AI = GetAIController();
-	if (!IsValid(AI)) return;
+	const UShooterAIBlackboard* BB = GetBlackboard();
+	if (!IsValid(AI) || !IsValid(BB)) return;
 
 	const FShooterBotDifficulty& D = AI->GetDifficulty();
 
 	// Tracking time only accumulates while the bot actually has the target. Losing sight resets it, so
 	// peeking in and out of cover costs the bot its settled aim every time - which is exactly why peeking
 	// beats standing in the open, and it falls out of this one line rather than needing its own rule.
-	if (AI->HasAcquiredTarget())
+	if (BB->HasAcquiredTarget())
 	{
 		TrackedTime += DeltaTime;
 	}
@@ -151,7 +278,13 @@ void UShooterAIAimComponent::UpdateAimError(float DeltaTime)
 	}
 
 	const float SettleAlpha = FMath::Clamp(TrackedTime / FMath::Max(D.AimSettleTime, KINDA_SMALL_NUMBER), 0.f, 1.f);
-	const float ErrorMagnitude = FMath::Lerp(D.AimErrorInitialDegrees, D.AimErrorSettledDegrees, SettleAlpha);
+	float ErrorMagnitude = FMath::Lerp(D.AimErrorInitialDegrees, D.AimErrorSettledDegrees, SettleAlpha);
+
+	// The core mechanic, applied to accuracy. A target standing still collapses the cone toward nothing; a
+	// target sliding, jumping or wall running blows it wide open. Two independent axes of skill on purpose:
+	// settle time rewards the bot for *holding* an angle, stillness rewards it for the target being easy.
+	DebugErrorScale = D.AimErrorStillnessResponse.Evaluate(BB->GetTargetStillness());
+	ErrorMagnitude *= DebugErrorScale;
 
 	ErrorRefreshTimer -= DeltaTime;
 	if (ErrorRefreshTimer <= 0.f)
@@ -165,6 +298,17 @@ void UShooterAIAimComponent::UpdateAimError(float DeltaTime)
 		const float Radius = FMath::Sqrt(FMath::FRand()) * ErrorMagnitude;
 		TargetErrorDegrees = FVector2D(FMath::Cos(Angle) * Radius, FMath::Sin(Angle) * Radius);
 	}
+	else
+	{
+		// Rescale the standing offset toward the current magnitude as well, so a target who stops moving is
+		// punished inside the same beat rather than at the next refresh. Without this the response to
+		// stillness is quantised to AimErrorRefreshInterval and reads as laggy.
+		const float TargetLength = TargetErrorDegrees.Size();
+		if (TargetLength > KINDA_SMALL_NUMBER && ErrorMagnitude < TargetLength)
+		{
+			TargetErrorDegrees *= (ErrorMagnitude / TargetLength);
+		}
+	}
 
 	// Interped so the error slides rather than snapping. Speed is tied to the refresh interval so the offset
 	// arrives at roughly the moment a new one is chosen - that reads as a hand micro-correcting, where a snap
@@ -173,39 +317,54 @@ void UShooterAIAimComponent::UpdateAimError(float DeltaTime)
 	CurrentErrorDegrees = FMath::Vector2DInterpTo(CurrentErrorDegrees, TargetErrorDegrees, DeltaTime, InterpSpeed);
 }
 
-void UShooterAIAimComponent::UpdateRotation(float DeltaTime, const FVector& AimPoint, bool bHaveAimPoint)
+/* --- Rotation --- */
+
+void UShooterAIAimComponent::UpdateRotation(float DeltaTime, const FVector& LookPoint, bool bHaveLookPoint)
 {
 	AShooterAIController* AI = GetAIController();
-	if (!IsValid(AI)) return;
+	const UShooterAIBlackboard* BB = GetBlackboard();
+	if (!IsValid(AI) || !IsValid(BB)) return;
 
 	const FShooterBotDifficulty& D = AI->GetDifficulty();
 	const FRotator CurrentRotation = AI->GetControlRotation();
 
 	FRotator DesiredRotation = CurrentRotation;
 
-	if (bHaveAimPoint)
+	if (bHaveLookPoint)
 	{
 		const FVector Eye = AI->GetEyeLocation();
-		const FVector ToAim = AimPoint - Eye;
-		if (ToAim.IsNearlyZero()) return;
-
-		DesiredRotation = ToAim.Rotation();
-		DesiredRotation.Pitch += CurrentErrorDegrees.X + AccumulatedPunchPitch;
-		DesiredRotation.Yaw += CurrentErrorDegrees.Y;
+		const FVector ToLook = LookPoint - Eye;
+		if (!ToLook.IsNearlyZero())
+		{
+			DesiredRotation = ToLook.Rotation();
+			DesiredRotation.Pitch += CurrentErrorDegrees.X + AccumulatedPunchPitch;
+			DesiredRotation.Yaw += CurrentErrorDegrees.Y;
+		}
 	}
-	else if (!bYawLocked)
+	else if (AimState != EShooterAimState::Traverse)
 	{
 		// Nothing to look at and no traversal claim on the yaw - leave the aim where it is rather than
 		// snapping it to level, which would look like the bot forgetting itself every time it loses sight.
 		return;
 	}
 
-	if (bYawLocked && !LockedTravelDirection.IsNearlyZero())
+	float TurnRate = D.MaxTurnRateDegrees;
+
+	if (AimState == EShooterAimState::Traverse && !ClaimedTravelDirection.IsNearlyZero())
 	{
-		// The movement tech layer owns the yaw for the duration of a wall-run attempt. Pitch is left on the
-		// target so the bot comes off the wall already looking roughly the right way - see the note on
-		// SetYawLockToTravel for why this trade is acceptable.
-		DesiredRotation.Yaw = LockedTravelDirection.Rotation().Yaw;
+		// Locomotion owns the yaw for the duration of the claim. Pitch stays on the look point so the bot
+		// comes off the wall already looking roughly the right way.
+		DesiredRotation.Yaw = ClaimedTravelDirection.Rotation().Yaw;
+
+		// The claim has a short deadline (see TraverseTurnRateMultiplier). This is not an aim advantage: the
+		// fire gate below refuses to shoot for the whole claim.
+		TurnRate *= TraverseTurnRateMultiplier;
+	}
+	else if (AimState == EShooterAimState::Track)
+	{
+		// The core mechanic, applied to tracking. A still target gets snapped onto; a moving one out-turns
+		// the bot's hand and the crosshair visibly trails behind them.
+		TurnRate *= D.TurnRateStillnessResponse.Evaluate(BB->GetTargetStillness());
 	}
 
 	DesiredRotation.Pitch = FMath::Clamp(FRotator::NormalizeAxis(DesiredRotation.Pitch), -89.f, 89.f);
@@ -214,42 +373,31 @@ void UShooterAIAimComponent::UpdateRotation(float DeltaTime, const FVector& AimP
 	// Constant rate, not proportional: this is a hand on a mouse, and it has a top speed. A proportional
 	// interp would make the bot snap most of the way instantly on a large angle, which is what reads as an
 	// aimbot even when the final accuracy is poor.
-	const FRotator NewRotation = FMath::RInterpConstantTo(CurrentRotation, DesiredRotation, DeltaTime, D.MaxTurnRateDegrees);
+	const FRotator NewRotation = FMath::RInterpConstantTo(
+		CurrentRotation, DesiredRotation, DeltaTime, FMath::Max(TurnRate, 1.f));
 
 	// Control rotation is the aim: AWeapon::WeaponTrace resolves its direction from the pawn's view rotation,
 	// which for a locally controlled pawn is this. The bot is genuinely pointing the gun, not being handed a
-	// hit result.
+	// hit result. It is also what turns the capsule, because BP_EnemyBot has bUseControllerRotationYaw set -
+	// which is why the traversal claim above is able to satisfy the wall run's forward-input test at all.
 	AI->SetControlRotation(NewRotation);
 }
 
-float UShooterAIAimComponent::GetAimErrorToTargetDegrees() const
-{
-	const AShooterAIController* AI = GetAIController();
-	if (!IsValid(AI)) return 180.f;
-
-	const APawn* Target = AI->GetTargetPawn();
-	if (!IsValid(Target)) return 180.f;
-
-	const FVector ToTarget = (Target->GetPawnViewLocation() - AI->GetEyeLocation()).GetSafeNormal();
-	if (ToTarget.IsNearlyZero()) return 180.f;
-
-	const FVector Facing = AI->GetControlRotation().Vector();
-	return FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(ToTarget | Facing, -1.f, 1.f)));
-}
+/* --- Aiming down sights --- */
 
 void UShooterAIAimComponent::UpdateAimDownSights()
 {
-	AShooterAIController* AI = GetAIController();
+	const AShooterAIController* AI = GetAIController();
+	const UShooterAIBlackboard* BB = GetBlackboard();
 	UCombatComponent* Combat = GetCombat();
-	if (!IsValid(AI) || !IsValid(Combat)) return;
+	if (!IsValid(AI) || !IsValid(BB) || !IsValid(Combat)) return;
 
-	const APawn* Target = AI->GetTargetPawn();
-
+	// Driven by the aim layer's own state, never by the tactical action: the bot should be able to hold its
+	// sights on the player through a reposition exactly as a player does.
 	bool bWantAim = false;
-	if (IsValid(Target) && AI->HasAcquiredTarget() && AI->GetBotState() == EShooterBotState::Engage)
+	if (AimState == EShooterAimState::Track && BB->HasAcquiredTarget())
 	{
-		const float Distance = FVector::Dist(Target->GetActorLocation(), AI->GetEyeLocation());
-		bWantAim = Distance >= AimDownSightsMinRange;
+		bWantAim = BB->GetDistanceToTarget() >= AimDownSightsMinRange;
 	}
 
 	if (bWantAim == bAimingDownSights) return;
@@ -268,13 +416,16 @@ void UShooterAIAimComponent::UpdateAimDownSights()
 	}
 }
 
+/* --- Trigger --- */
+
 void UShooterAIAimComponent::UpdateTrigger(float DeltaTime)
 {
-	AShooterAIController* AI = GetAIController();
+	const AShooterAIController* AI = GetAIController();
+	const UShooterAIBlackboard* BB = GetBlackboard();
 	UCombatComponent* Combat = GetCombat();
 	AWeapon* Weapon = GetWeapon();
 
-	if (!IsValid(AI) || !IsValid(Combat) || !IsValid(Weapon))
+	if (!IsValid(AI) || !IsValid(BB) || !IsValid(Combat) || !IsValid(Weapon))
 	{
 		ReleaseTrigger();
 		return;
@@ -295,12 +446,15 @@ void UShooterAIAimComponent::UpdateTrigger(float DeltaTime)
 	}
 	AmmoAtLastCheck = Weapon->Ammo;
 
+	// Deliberately not conditioned on the tactical action. Shooting is an aim-layer concern, so the bot will
+	// take a free shot during an approach or a reposition exactly as a player would - the old bot could only
+	// fire in one state, which meant every reposition was several seconds of running past an open target with
+	// the trigger down.
 	const bool bCanFire =
-		AI->GetBotState() == EShooterBotState::Engage &&
-		AI->HasAcquiredTarget() &&
-		AI->HasLineOfSight() &&
-		Weapon->Ammo > 0 &&
-		GetAimErrorToTargetDegrees() <= D.FireAngleToleranceDegrees;
+		!bFireSuppressed &&
+		AimState == EShooterAimState::Track &&
+		AI->WantsToShoot() &&
+		BB->GetAngleToTargetDegrees() <= D.FireAngleToleranceDegrees;
 
 	if (!bCanFire)
 	{
@@ -379,6 +533,20 @@ void UShooterAIAimComponent::ReleaseTrigger()
 	bTriggerHeld = false;
 }
 
+void UShooterAIAimComponent::SetFireSuppressed(bool bSuppressed)
+{
+	if (bFireSuppressed == bSuppressed) return;
+
+	bFireSuppressed = bSuppressed;
+
+	// Dropped immediately rather than at the next UpdateTrigger, so the trigger is never left latched on
+	// UCombatComponent across the frame the suppression starts.
+	if (bFireSuppressed)
+	{
+		HoldFire();
+	}
+}
+
 void UShooterAIAimComponent::HoldFire()
 {
 	ReleaseTrigger();
@@ -401,11 +569,28 @@ void UShooterAIAimComponent::ApplyViewPunch()
 	AccumulatedPunchPitch = FMath::Min(AccumulatedPunchPitch + Punch, FMath::Max(Ceiling, 0.f));
 }
 
-void UShooterAIAimComponent::SetYawLockToTravel(bool bLock, const FVector& TravelDirection)
+/* --- Debug --- */
+
+void UShooterAIAimComponent::DrawAimDebug() const
 {
-	bYawLocked = bLock;
-	if (bLock && !TravelDirection.IsNearlyZero())
+	const AShooterAIController* AI = GetAIController();
+	if (!IsValid(AI) || !IsValid(GetWorld())) return;
+
+	const FVector Eye = AI->GetEyeLocation();
+
+	// Where the bot is actually pointing the gun, including its aim error. The gap between this and the green
+	// LOS line the controller draws is the bot's inaccuracy made visible - the single most useful thing to
+	// watch while tuning the stillness response.
+	if (!DebugLookPoint.IsNearlyZero())
 	{
-		LockedTravelDirection = TravelDirection.GetSafeNormal();
+		DrawDebugLine(GetWorld(), Eye, DebugLookPoint, FColor::Magenta, false, -1.f, 0, 1.f);
+		DrawDebugPoint(GetWorld(), DebugLookPoint, 12.f, FColor::Magenta, false, -1.f);
+	}
+
+	// The traversal claim, when one is held. Orange means locomotion currently owns the yaw - if this is on
+	// screen while the bot is not visibly wall running, the wall-run commit is failing.
+	if (bTravelYawClaimed)
+	{
+		DrawDebugLine(GetWorld(), Eye, Eye + ClaimedTravelDirection * 400.f, FColor::Orange, false, -1.f, 0, 3.f);
 	}
 }

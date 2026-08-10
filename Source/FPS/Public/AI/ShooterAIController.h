@@ -10,7 +10,9 @@
 class AShooterCharacter;
 class AWeapon;
 class UCombatComponent;
+class UHealthComponent;
 class UShooterAIAimComponent;
+class UShooterAIBlackboard;
 class UShooterAIMovementTechComponent;
 class UShooterMovementComponent;
 
@@ -21,28 +23,36 @@ class UShooterMovementComponent;
  * needs to draw the result.
  *
  * ---------------------------------------------------------------------------------------------------------
- * Why there is no Behaviour Tree
+ * The decision model: commitment plus invalidation
  *
- * A BT would be the conventional choice, and the tactical layer here is written as a plain C++ state machine
- * instead. Two reasons, in order of weight:
+ * Adapted from Game AI Pro 3 ch.10, "From Behavior to Animation". The bot does NOT re-decide what it is doing
+ * every frame, or even on a fixed interval. Instead:
  *
- *  1. A BT needs a BehaviourTree asset and a Blackboard asset, both binary .uasset files that have to be
- *     authored in the editor. Building the bot as a state machine means the entire AI works from a fresh
- *     compile with no asset authoring at all - which is the difference between "run it and see" and "follow
- *     nine editor steps first".
- *  2. A 1v1 bot has five mutually exclusive states and no task-tree structure worth speaking of. A BT's
- *     value is composition and reuse across many behaviours; at this size it is ceremony, and the decision
- *     logic ends up spread across a dozen tiny UBTTask_ classes plus a graph you cannot read in a diff.
+ *  1. Selection picks one long-lived **action** and records the set of **latched conditions** it was chosen
+ *     under (EShooterAILatch). That is the chapter's `parallel` node, made explicit: the only part of the
+ *     decision that gets re-examined is the part that had to be true for it to be the right decision.
+ *  2. The action then runs, untouchable, for at least ActionMinCommitTime. Inside that window nothing but an
+ *     interrupt can change the bot's mind.
+ *  3. After that window the latches are checked each tick. One failure invalidates the action and selection
+ *     runs again from the top. A max duration backstops anything that would otherwise latch forever.
+ *  4. **Interrupts** (EShooterAIInterrupt) bypass the commitment window entirely and force an immediate
+ *     re-selection. They are edge-triggered, live exactly one update, and resolve by a fixed priority list.
  *
- * If the state list ever grows past roughly a dozen states, or if designer-authored behaviour becomes the
- * point, this is the class to port to a State Tree - the per-state Decide/Drive split below maps onto one
- * almost directly.
+ * That model is the direct fix for a bot that "flits between directions frame to frame". The old version
+ * re-ran a full decision every 0.25s with no memory of having just made one, so any two states whose
+ * conditions sat near a boundary swapped back and forth indefinitely - and every swap reset the strafe.
+ *
+ * Why there is no Behaviour Tree: a BT needs two binary .uasset files authored in the editor before the bot
+ * does anything at all, and a 1v1 bot has six mutually exclusive actions and no task-tree structure worth
+ * composing. Keeping it in C++ means the entire decision layer is diffable and works from a fresh compile.
+ * If the action list ever grows past roughly a dozen, this is the class to port to a State Tree - the
+ * Select/Enter/Drive split below maps onto one almost directly.
  * ---------------------------------------------------------------------------------------------------------
  *
- * Responsibilities are split three ways: this class owns perception, target memory and the state machine;
- * UShooterAIAimComponent owns where the bot is looking and when it pulls the trigger;
- * UShooterAIMovementTechComponent owns sprint / slide / jump / wall run. The two components read state from
- * here and never talk to each other.
+ * Responsibilities are split four ways. UShooterAIBlackboard is the shared knowledge store and the only thing
+ * that touches perception; this class owns action selection and move goals; UShooterAIAimComponent owns where
+ * the bot looks and when it shoots; UShooterAIMovementTechComponent owns sprint / slide / jump / wall run.
+ * The three components never talk to each other - they read the blackboard and route requests through here.
  */
 UCLASS()
 class FPS_API AShooterAIController : public AAIController
@@ -60,29 +70,21 @@ public:
 
 	const FShooterBotDifficulty& GetDifficulty() const { return Difficulty; }
 
-	EShooterBotState GetBotState() const { return BotState; }
+	UShooterAIBlackboard* GetKnowledge() const { return Knowledge; }
 
-	/** The pawn this bot is fighting. Null when it has never seen anyone. */
-	APawn* GetTargetPawn() const { return TargetPawn.Get(); }
+	EShooterBotAction GetAction() const { return CurrentAction; }
 
-	/** True only while an unbroken line of sight exists right now. Ignores the reaction delay. */
-	bool HasLineOfSight() const { return bHasLineOfSight; }
+	/** Seconds the current action has been running. */
+	float GetActionElapsed() const { return ActionElapsed; }
 
-	/**
-	 * True once line of sight has been held for at least ReactionTime. This - not HasLineOfSight - is what
-	 * the aim and fire logic is allowed to act on, and the split is the whole of the bot's reaction time.
-	 */
-	bool HasAcquiredTarget() const { return bTargetAcquired; }
-
-	/** Where the target was last seen. Valid whenever GetTargetPawn() is non-null. */
-	FVector GetLastKnownTargetLocation() const { return LastKnownTargetLocation; }
-
-	/** Target velocity sampled at the last frame line of sight was held. Used for aim leading. */
-	FVector GetLastKnownTargetVelocity() const { return LastKnownTargetVelocity; }
-
-	/** Seconds since line of sight was last held. Compare against Difficulty.TargetMemoryTime to decide
-	 *  whether the last known position is still worth acting on. */
-	float GetTimeSinceLineOfSight() const { return TimeSinceLineOfSight; }
+	// Convenience forwarders onto the blackboard. Kept on the controller because every module already has a
+	// pointer to it, and because "the bot knows X" reads better than reaching through two objects for it.
+	APawn* GetTargetPawn() const;
+	bool HasLineOfSight() const;
+	bool HasAcquiredTarget() const;
+	bool IsTargetLive() const;
+	float GetTargetStillness() const;
+	FVector GetLastKnownTargetLocation() const;
 
 	/** The bot's own eye position - the origin AWeapon::WeaponTrace will fire from. */
 	FVector GetEyeLocation() const;
@@ -91,12 +93,58 @@ public:
 	UCombatComponent* GetCombat() const;
 	UShooterMovementComponent* GetShooterMovement() const;
 
-	/** Where the bot is currently trying to get to. Movement tech reads this to decide about sliding. */
+	/**
+	 * Where the bot is currently trying to get to, when it is *pathing*.
+	 *
+	 * Only meaningful while HasMoveGoal() is true. In a fight the bot steers instead - see UpdateSteering -
+	 * and there is deliberately no goal at all, because "pick a point, path to it, arrive, pick another" is
+	 * what made the old bot read as point-and-click rather than as a player.
+	 */
 	FVector GetMoveGoal() const { return MoveGoal; }
 	bool HasMoveGoal() const { return bHasMoveGoal; }
+	float GetDistanceToMoveGoal() const;
+
+	/** True while the bot is driving itself with continuous steering input instead of following a path. */
+	bool IsSteering() const { return bSteering; }
+
+	/** The smoothed world-space direction the steering layer is currently pushing. Zero when pathing. */
+	FVector GetSteeringDirection() const { return bSteering ? SteeringDirection : FVector::ZeroVector; }
 
 	/** Range the bot tries to hold, adjusted for the equipped weapon's fire type. */
 	float GetPreferredRange() const;
+
+	/**
+	 * True when the bot has a shot it wants to take right now, ignoring whether its aim has arrived yet.
+	 *
+	 * Asked by the movement-tech layer, not just by the trigger. Sprinting blocks firing, and
+	 * UCombatComponent::Initiate_FireWeapon_Pressed cancels the sprint on the shooter's behalf - so a
+	 * movement layer that keeps re-asserting sprint intent while the aim layer keeps firing produces a
+	 * per-frame tug of war over the sprint flag, which is visible as a stuttering run speed. Both layers read
+	 * this one answer instead.
+	 */
+	bool WantsToShoot() const;
+
+	// --- Yaw arbitration between locomotion and aim ------------------------------------------------
+
+	/**
+	 * Locomotion asking the aim layer to point the bot's yaw along a travel direction instead of at its
+	 * target. Returns true only if the claim was granted.
+	 *
+	 * Routed through the controller rather than component-to-component so the two AI components keep their
+	 * one-way dependency on this class. See UShooterAIAimComponent::RequestTravelYawClaim for the grant rules
+	 * - the short version is that a live target can only be looked away from deliberately, briefly, and by a
+	 * small angle, which is what stops "the bot turns its back on me" from being an emergent side effect.
+	 */
+	bool RequestTravelYawClaim(const FVector& TravelDirection, bool bForce);
+	void ReleaseTravelYawClaim();
+	bool HasTravelYawClaim() const;
+
+	/** True once the capsule's forward vector is within DotThreshold of the claimed travel direction. */
+	bool IsTravelYawAligned(float DotThreshold) const;
+
+	/** Locomotion asking the aim layer to hold fire while it spends a beat on movement tech. Same arbitration
+	 *  shape as the yaw claim - see UShooterAIAimComponent::SetFireSuppressed. */
+	void SetFireSuppressed(bool bSuppressed);
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Debug")
 	bool bDebugDrawAI;
@@ -115,31 +163,11 @@ protected:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Difficulty")
 	FShooterBotDifficulty Difficulty;
 
-	/** How far the bot can see. Also caps the LOS trace, so it is a real perception limit, not just a filter. */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Perception", meta = (ClampMin = "100.0"))
-	float SightRange;
-
-	/** Half-angle of the bot's forward vision cone, in degrees. Outside it the target is unseen. */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Perception", meta = (ClampMin = "5.0", ClampMax = "180.0"))
-	float SightHalfAngleDegrees;
-
-	/**
-	 * Gunfire heard within this range acquires the shooter's position even with no line of sight. In a 1v1
-	 * a fired shot is the loudest possible tell, and a bot that ignores being shot at from behind reads as
-	 * broken rather than as easy. Set to 0 to make the bot sight-only.
-	 */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Perception", meta = (ClampMin = "0.0"))
-	float HearingRange;
-
-	/** How often the bot re-checks who its opponent is. Cheap, but there is no reason to do it per frame. */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Perception", meta = (ClampMin = "0.1"))
-	float TargetRefreshInterval;
-
 	/** Radius the bot searches within when picking a reposition or retreat destination. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Tactics", meta = (ClampMin = "100.0"))
 	float RepositionSearchRadius;
 
-	/** How close counts as "arrived" for a reposition or hunt goal. */
+	/** How close counts as "arrived" for a move goal. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Tactics", meta = (ClampMin = "10.0"))
 	float GoalAcceptanceRadius;
 
@@ -148,18 +176,22 @@ protected:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Combat", meta = (ClampMin = "0.2"))
 	float ReloadWatchdogTime;
 
-	/** How often a hunting bot picks a fresh search destination even if it has not arrived yet. Without this
-	 *  a hunt only re-evaluates on arrival, so an unreachable goal parks the bot. */
+	/** How often a hunting bot picks a fresh search destination even if it has not arrived yet. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Tactics", meta = (ClampMin = "0.2"))
 	float HuntRepathInterval;
 
+	/** How often an approaching bot refreshes its destination as the target moves. Long enough that the bot
+	 *  commits to a route rather than re-pathing onto every frame's new target position. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Tactics", meta = (ClampMin = "0.1"))
+	float ApproachRepathInterval;
+
 	/**
-	 * Longest any state may pursue one move goal before it is abandoned and the state machine re-decides.
+	 * Longest any action may pursue one move goal before it is abandoned and the bot re-selects.
 	 *
-	 * This is a deliberate backstop against a whole class of bug rather than one instance of it: a state that
-	 * latches on "I still have a goal I have not reached" stops responding to anything if the goal turns out
-	 * to be unreachable - partial paths, a nav link the capsule cannot take, geometry that moved. A bot stood
-	 * still is the single worst failure mode here, because it looks exactly like broken AI.
+	 * A deliberate backstop against a whole class of bug rather than one instance of it: an action latched on
+	 * GoalPending stops responding to anything if the goal turns out to be unreachable - partial paths, a nav
+	 * link the capsule cannot take, geometry that moved. A bot stood still is the single worst failure mode
+	 * here, because it looks exactly like broken AI.
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Tactics", meta = (ClampMin = "0.5"))
 	float MoveGoalTimeout;
@@ -168,61 +200,154 @@ protected:
 	 * When the bot has lost its target and no visible-from candidate position can be found, head toward the
 	 * target's actual current position rather than standing still.
 	 *
-	 * This is knowingly a small piece of omniscience, and it is a playability decision, not an oversight: the
+	 * Knowingly a small piece of omniscience, and a playability decision rather than an oversight: the
 	 * alternative is a bot that can be permanently lost by walking round one corner, which in a 1v1 practice
 	 * opponent is worse than a bot that walks your way. Its reaction time, turn rate and aim error all still
-	 * apply on arrival, so it does not get a free kill out of it - it only gets to find you. Turn off for a
-	 * strictly fair bot that can be genuinely evaded.
+	 * apply on arrival, so it only gets to find you, never to shoot you better. Turn off for a strictly fair
+	 * bot that can be genuinely evaded.
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Tactics")
 	bool bSearchTowardTargetWhenLost;
 
+	// --- Steering -------------------------------------------------------------------------------------
+	//
+	// Fighting locomotion. A human circling an opponent applies continuous sideways input; they do not walk
+	// between survey markers. So inside engagement range the bot has no move goal at all and builds a desired
+	// direction every tick from a handful of weighted terms, fed straight into AddMovementInput.
+	//
+	// Pathfinding is still used for everything outside a fight (Hunt, a long Approach, Retreat), because
+	// crossing an arena genuinely is a pathfinding problem and pure steering cannot solve concave geometry.
+
+	/** How hard the bot corrects toward its preferred range, per unit of normalised range error. Higher
+	 *  closes and backs off more urgently; too high and the bot yo-yos on the radial axis. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Steering", meta = (ClampMin = "0.0", ClampMax = "8.0"))
+	float SteerRadialGain;
+
+	/** Orbit strength while strafing. The side is committed by the strafe leg; this is how hard it circles. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Steering", meta = (ClampMin = "0.0", ClampMax = "3.0"))
+	float SteerTangentWeightStrafe;
+
+	/** Orbit strength while closing. Low, so an approach mostly closes rather than spiralling in. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Steering", meta = (ClampMin = "0.0", ClampMax = "3.0"))
+	float SteerTangentWeightApproach;
+
+	/** Extra tangential weight at the start of a reposition arc, decaying to zero across its duration. This
+	 *  is what turns a reposition from a waypoint into a visible swing wide off the current angle. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Steering", meta = (ClampMin = "0.0", ClampMax = "4.0"))
+	float SteerRepositionTangentBoost;
+
+	/** How much a reposition leans toward the cover direction FindTacticalDestination scored. The search is
+	 *  still doing the thinking; its answer is just consumed as a direction rather than as a destination. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Steering", meta = (ClampMin = "0.0", ClampMax = "3.0"))
+	float SteerRepositionBiasWeight;
+
+	/** Multiple of the preferred range inside which an Approach steers instead of pathing. Beyond it the bot
+	 *  is crossing the map, which is a pathfinding problem. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Steering", meta = (ClampMin = "1.0", ClampMax = "10.0"))
+	float SteerRangeMultiplier;
+
+	/** How quickly the steering direction may change, as an interp speed. This is the bot's body inertia:
+	 *  low reads as heavy and deliberate, high reads as twitchy. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Steering", meta = (ClampMin = "0.5"))
+	float SteerTurnInterpSpeed;
+
+	/** Peak wander applied to the steering direction, in degrees. Without it the bot orbits like a turret
+	 *  platform on rails, which is readable and trivially pre-aimed. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Steering", meta = (ClampMin = "0.0", ClampMax = "90.0"))
+	float SteerNoiseMaxDegrees;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Steering", meta = (ClampMin = "0.05"))
+	float SteerNoiseIntervalMin;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Steering", meta = (ClampMin = "0.05"))
+	float SteerNoiseIntervalMax;
+
+	/** Length of the forward avoidance whisker. Side whiskers are 70% of it. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Steering", meta = (ClampMin = "20.0"))
+	float SteerWhiskerLength;
+
+	/** Splay of the side whiskers off the intended direction, in degrees. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Steering", meta = (ClampMin = "5.0", ClampMax = "89.0"))
+	float SteerWhiskerAngleDegrees;
+
+	/** How strongly a whisker hit pushes the steering direction away along the surface normal. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Steering", meta = (ClampMin = "0.0", ClampMax = "5.0"))
+	float SteerAvoidWeight;
+
+	/** How far ahead the intended step is projected onto the nav mesh. This is the containment check that
+	 *  keeps a steered bot on navigable ground without needing a path - it is what stops it steering off a
+	 *  terrace or into a wall the whiskers happened to miss. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Steering", meta = (ClampMin = "20.0"))
+	float SteerNavProbeDistance;
+
+	/** Largest height change between the bot's feet and the projected step that still counts as navigable.
+	 *  Sized above the nav mesh's own offset from the floor, or every step reads as a drop. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Steering", meta = (ClampMin = "10.0"))
+	float SteerNavMaxStepHeight;
+
+	/**
+	 * How long the steering layer may find no navigable deflection before it gives up and asks for a path.
+	 *
+	 * The explicit answer to the known trade-off: steering does not pathfind, so a steered bot can wedge
+	 * itself in concave geometry. Rather than pretend that cannot happen, this detects it and hands the
+	 * problem to the nav mesh for a bounded window.
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Steering", meta = (ClampMin = "0.1"))
+	float SteerBlockedRecoveryTime;
+
+	/** How long the recovery path is allowed to run before steering is attempted again. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Steering", meta = (ClampMin = "0.2"))
+	float SteerRecoveryPathTime;
+
 private:
+	UPROPERTY()
+	TObjectPtr<UShooterAIBlackboard> Knowledge;
+
 	UPROPERTY()
 	TObjectPtr<UShooterAIAimComponent> AimLogic;
 
 	UPROPERTY()
 	TObjectPtr<UShooterAIMovementTechComponent> MovementTech;
 
-	// --- Perception -------------------------------------------------------------------------------
+	// --- Action selection: commitment plus invalidation --------------------------------------------
 
-	void RefreshTarget();
-	void UpdatePerception(float DeltaTime);
+	void UpdateActionSelection(float DeltaTime);
 
-	/** Eye-to-eye trace on the visibility channel. Both the pawn capsule and the character mesh ignore that
-	 *  channel, so a clear shot registers as "no blocking hit" rather than as a hit on the target. */
-	bool TraceLineOfSight(const APawn* Target) const;
+	/**
+	 * Chooses the action for this selection pass and, via OutLatches, the conditions it is committing to.
+	 * Pure decision - issues no orders and touches no timers.
+	 */
+	EShooterBotAction SelectAction(EShooterAIInterrupt Interrupt, EShooterAILatch& OutLatches,
+		float& OutMinCommit, float& OutMaxDuration) const;
 
-	TWeakObjectPtr<APawn> TargetPawn;
-	bool bHasLineOfSight;
-	bool bTargetAcquired;
-	float LineOfSightHeldTime;
-	float TimeSinceLineOfSight;
-	float TargetRefreshTimer;
-	FVector LastKnownTargetLocation;
-	FVector LastKnownTargetVelocity;
+	/** True while every latched condition in Mask still holds. */
+	bool EvaluateLatches(EShooterAILatch Mask) const;
 
-	// --- State machine ----------------------------------------------------------------------------
+	/** Called once on entry, so per-action setup (picking a destination, dropping the trigger) happens once. */
+	void EnterAction(EShooterBotAction NewAction, EShooterAILatch Latches, float MinCommit, float MaxDuration);
 
-	void UpdateStateMachine(float DeltaTime);
+	/** Called every frame for the active action. This is where move orders are issued. */
+	void DriveAction(float DeltaTime);
 
-	/** Chooses the state for this decision tick. Pure decision - issues no orders. */
-	EShooterBotState DecideState() const;
-
-	/** Called once on entry, so per-state setup (picking a destination, dropping the trigger) happens once. */
-	void EnterState(EShooterBotState NewState);
-
-	/** Called every frame for the active state. This is where move orders are issued. */
-	void DriveState(float DeltaTime);
-
-	void DriveEngage(float DeltaTime);
 	void DriveHunt(float DeltaTime);
-	void DriveReposition();
+	void DriveApproach(float DeltaTime);
+	void DriveStrafe(float DeltaTime);
+	void DriveReposition(float DeltaTime);
 	void DriveRetreat();
 
-	EShooterBotState BotState;
-	float DecisionTimer;
-	float StateTime;
+	EShooterBotAction CurrentAction;
+	EShooterAILatch CurrentLatches;
+	float ActionElapsed;
+	float ActionMinCommit;
+	float ActionMaxDuration;
+
+	/** Suppresses health-driven retreats for RetreatCooldown after one finishes, so a low-health bot comes
+	 *  back and fights instead of kiting for the rest of the match. */
+	float RetreatSuppressedTimer;
+
+	/** Time since the reposition die was last rolled, so a per-second chance stays per-second even though
+	 *  selection now runs at irregular intervals. */
+	float TimeSinceRepositionRoll;
 
 	// --- Movement ---------------------------------------------------------------------------------
 
@@ -230,11 +355,57 @@ private:
 	void RequestMoveTo(const FVector& Location);
 	void StopMoving();
 
+	bool HasReachedMoveGoal() const;
+
+	// --- Steering ---------------------------------------------------------------------------------
+
+	/**
+	 * Switches locomotion to continuous steering. Aborts any path in progress, because path following and
+	 * the steering layer both write AddMovementInput and would otherwise fight for the frame.
+	 */
+	void BeginSteering();
+	void EndSteering();
+
+	/** Builds this frame's desired direction and applies it. Called from the Drive functions that steer. */
+	void UpdateSteering(float DeltaTime);
+
+	/**
+	 * Deflects Desired away from whisker hits and then onto navigable ground, trying progressively wider
+	 * angles. Sets bOutBlocked when nothing within +/-110 degrees lands on the nav mesh - which is the
+	 * signal that steering has wedged and the nav mesh needs to take over.
+	 */
+	FVector ResolveSteeringObstacles(const FVector& Desired, bool& bOutBlocked) const;
+
+	void UpdateSteerNoise(float DeltaTime);
+
+	/** True while the bot is close enough to a fight to steer rather than path. Hysteretic, so the two
+	 *  locomotion models cannot swap every time the range wobbles across one line. */
+	bool ShouldActionSteer() const;
+
+	bool bSteering;
+	FVector SteeringDirection;
+	float SteerBlockedTime;
+	float SteerRecoveryTimer;
+
+	float SteerNoiseCurrent;
+	float SteerNoiseTarget;
+	float SteerNoiseTimer;
+
+	/** Remaining time on the reposition arc's extra tangential weight. Zero outside a reposition. */
+	float RepositionArcRemaining;
+
+	/** Direction FindTacticalDestination scored as the best new angle, consumed as a lean rather than as a
+	 *  destination. Zero when the search found nothing. */
+	FVector RepositionBiasDirection;
+
 	/** A navigable point roughly AwayFrom-relative-to-target, used for repositioning and retreating. */
 	bool FindTacticalDestination(bool bBreakLineOfSight, FVector& OutLocation) const;
 
-	/** Perpendicular strafe destination at the preferred range, alternating side on a timer. */
+	/** Perpendicular strafe destination at the preferred range, on the currently committed side. */
 	FVector ComputeStrafeDestination() const;
+
+	/** A point on the bot-to-target line at the preferred range. */
+	FVector ComputeApproachDestination() const;
 
 	FVector MoveGoal;
 	bool bHasMoveGoal;
@@ -245,17 +416,27 @@ private:
 	/** Counts down to the next hunt re-path. */
 	float HuntRepathTimer;
 
-	float StrafeTimer;
+	/** Counts down to the next approach re-path. */
+	float ApproachRepathTimer;
+
+	/**
+	 * Remaining time on the current strafe leg, and the side it is committed to.
+	 *
+	 * A leg is the unit of commitment for strafing: the side is chosen once, one destination is issued, and
+	 * neither is reconsidered until the leg expires. The old bot flipped StrafeSign on entry to Engage, which
+	 * meant every bounce out of Reposition reversed its direction - the "flits between directions" complaint
+	 * in one line.
+	 */
+	float StrafeLegRemaining;
 	int32 StrafeSign;
 
 	// --- Combat -----------------------------------------------------------------------------------
 
-	/** Ammo/health housekeeping that is not the aim component's business: the tactical reload and the
-	 *  watchdog that guarantees a bot's reload finishes even if the 3P montage carries no notify. */
+	/** Ammo housekeeping that is not the aim component's business: the tactical reload and the watchdog that
+	 *  guarantees a bot's reload finishes even if the 3P montage carries no notify. */
 	void UpdateWeaponHousekeeping(float DeltaTime);
 
 	bool ShouldReloadNow() const;
-	float HealthFraction() const;
 
 	/**
 	 * Reload completion for the bot is driven from here rather than from the animation.
@@ -271,5 +452,12 @@ private:
 
 	float ReloadWatchdogTimer;
 
+	/** Bound to the pawn's health component so being shot raises the highest-priority interrupt. */
+	UFUNCTION()
+	void OnPawnHealthChanged(UHealthComponent* HealthComponent, float OldValue, float NewValue, AActor* DamageInstigator);
+
+	TWeakObjectPtr<UHealthComponent> BoundHealth;
+
 	void DrawDebug() const;
+	void DrawSteeringDebug() const;
 };

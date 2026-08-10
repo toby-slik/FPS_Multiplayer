@@ -4,10 +4,12 @@
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
+#include "AI/ShooterAITypes.h"
 #include "ShooterAIMovementTechComponent.generated.h"
 
 class AShooterAIController;
 class AShooterCharacter;
+class UShooterAIBlackboard;
 class UShooterMovementComponent;
 
 /**
@@ -24,14 +26,37 @@ class UShooterMovementComponent;
  * runs its own detection and its own cooldowns. That is the point - the movement component stays the single
  * authority on what is legal, and this component only decides what to *try*.
  *
+ * ---------------------------------------------------------------------------------------------------------
+ * Why the bot never wall ran, and what a wall run now is
+ *
+ * UShooterMovementComponent::TryStartWallRun has a gate that no other movement tech has: movement input must
+ * point along the *capsule's* forward vector (WallRunMinForwardInputDot, 0.5) for the whole attach window,
+ * and the capsule's yaw follows the control rotation, which the aim layer is writing onto the target. Four
+ * things then went wrong, and all four had to be fixed:
+ *
+ *  1. The old code pressed jump first and asked the aim layer to swing the yaw onto travel afterwards, at
+ *     MaxTurnRateDegrees (220 deg/s). A 90-degree swing takes 0.41s and a 180-degree swing 0.8s, but the
+ *     attach window is only the ~0.7s of airtime during which the bot is falling. It usually arrived facing
+ *     the right way a moment after the opportunity had passed. A wall run is now a committed multi-phase
+ *     action that lines the yaw up on the ground FIRST and only jumps once it is aligned.
+ *  2. The wall probe traced along the capsule's right vector - i.e. sideways relative to where the bot was
+ *     *looking*, not where it was *going*. With the aim on the player that is an essentially unrelated
+ *     direction, so the bot committed to walls it was about to run head-first into. The probe is now taken
+ *     perpendicular to the travel direction, and the surface must additionally be roughly parallel to travel.
+ *  3. WallProbeDistance defaulted above the character's WallRunTraceDistance, so a "found" wall could be out
+ *     of the movement component's own attach range. It now defaults just inside it.
+ *  4. The scan was excluded from the engagement states, which is where a duelling bot spends the match. It
+ *     now runs during any traversal action, including Approach.
+ * ---------------------------------------------------------------------------------------------------------
+ *
  * A consequence worth understanding: the thresholds below are duplicates of the character's, not reads of
  * them. The character's FPS|Movement values are protected (UShooterMovementComponent is a friend of it; this
  * is not), so these are the bot's own heuristics for when an attempt is worth making. They should sit at or
- * above the character's real thresholds - if they sit below, the bot simply makes attempts that the movement
- * component refuses, which costs nothing but noise.
+ * inside the character's real thresholds - outside them, the bot commits to attempts the movement component
+ * will refuse, and a refused wall run still costs the bot its aim for the length of the commit window.
  *
- * Ticked explicitly from AShooterAIController::Tick, before the aim component, because a wall-run attempt has
- * to be able to claim the yaw for that frame before aim writes the control rotation.
+ * Ticked explicitly from AShooterAIController::Tick, before the aim component, because a traversal yaw claim
+ * has to be raised before aim writes the control rotation for the frame.
  */
 UCLASS()
 class FPS_API UShooterAIMovementTechComponent : public UActorComponent
@@ -43,14 +68,15 @@ public:
 
 	void TickMovementTech(float DeltaTime);
 
-	/** True while a wall-run attempt or an active wall run needs the bot facing along its travel direction. */
-	bool WantsYawLockedToTravel() const;
+	/** Clears sprint intent, any pending tech and any yaw claim. Called when the bot dies or is re-possessed. */
+	void ResetTech();
 
 	/** The direction the bot is actually travelling - path-following input if there is any, else velocity. */
 	FVector GetTravelDirection() const;
 
-	/** Clears sprint intent and any pending tech. Called when the bot dies or the state machine resets. */
-	void ResetTech();
+	EShooterTechAction GetTechAction() const { return TechAction; }
+
+	void DrawTechDebug() const;
 
 protected:
 	// --- Sprint -----------------------------------------------------------------------------------
@@ -59,6 +85,17 @@ protected:
 	 *  skidding past. Sprint blocks firing by design, so this is a tactical value, not a cosmetic one. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Movement", meta = (ClampMin = "0.0"))
 	float SprintMinGoalDistance;
+
+	/**
+	 * Shortest time a sprint decision stands before it may be reversed.
+	 *
+	 * Sprint blocks firing and UCombatComponent::Initiate_FireWeapon_Pressed cancels the sprint on the
+	 * shooter's behalf, so the two layers can end up fighting over the flag frame by frame - which is visible
+	 * as a run speed that flickers between WalkSpeed and SprintSpeed. Commitment here, exactly as in the
+	 * tactical layer, is what makes the bot's travel read as deliberate.
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Movement", meta = (ClampMin = "0.0"))
+	float SprintMinHoldTime;
 
 	// --- Slide ------------------------------------------------------------------------------------
 
@@ -79,18 +116,34 @@ protected:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Movement")
 	bool bSlideToEvade;
 
+	/**
+	 * How long an evasive slide may sprint to buy the speed a slide needs before giving up.
+	 *
+	 * A steering bot fighting at close range has no move goal and is deliberately never sprinting, because
+	 * sprint blocks firing. So an in-fight slide has to prime itself: this is the window during which the bot
+	 * has chosen movement over shooting, and it is exactly the trade a player makes when they sprint-cancel
+	 * into a slide mid-duel. Keep it short - it is a beat, not a retreat.
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Movement", meta = (ClampMin = "0.05", ClampMax = "2.0"))
+	float SlideSprintPrimeTime;
+
 	// --- Wall run ---------------------------------------------------------------------------------
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Movement")
 	bool bAllowWallRun;
 
-	/** Sideways probe length when looking for a wall worth running. Should roughly match the character's
-	 *  WallRunTraceDistance - shorter and the bot commits too late, longer and it commits to walls the
-	 *  movement component will not accept. */
+	/**
+	 * Sideways probe length when looking for a wall worth running.
+	 *
+	 * Must sit at or just *inside* the character's WallRunTraceDistance (75 by default). Longer and the bot
+	 * commits its yaw, its jump and its aim to a wall UShooterMovementComponent::FindRunnableWall will then
+	 * refuse to attach to, which is a silent and expensive failure.
+	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Movement", meta = (ClampMin = "10.0"))
 	float WallProbeDistance;
 
-	/** Horizontal speed the bot requires before attempting a wall run. */
+	/** Horizontal speed the bot requires before attempting a wall run. At or above the character's
+	 *  WallRunMinSpeed, since a run that attaches below it ends on the same frame. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Movement", meta = (ClampMin = "0.0"))
 	float WallRunAttemptMinSpeed;
 
@@ -98,9 +151,28 @@ protected:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Movement", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float WallProbeMaxNormalZ;
 
-	/** How long the bot holds its yaw along its travel direction after jumping at a wall, waiting for the
-	 *  movement component to attach. Too short and it looks away before the attach test runs; too long and
-	 *  it stares down a corridor it has already left. */
+	/**
+	 * How head-on a wall may be and still count as runnable, as |wall normal . travel direction|.
+	 *
+	 * The check the old probe was missing. A surface can be perfectly vertical, within range and on the
+	 * correct side, and still be a wall the bot is about to run straight into - which produces a jump into a
+	 * dead stop rather than a wall run. Low values demand a wall genuinely parallel to the route.
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Movement", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float WallProbeMaxTravelDot;
+
+	/** How closely the capsule must face along travel before the bot commits and jumps, as a dot product.
+	 *  Comfortably above the character's WallRunMinForwardInputDot (0.5) so the attach test cannot fail on
+	 *  the very margin this phase exists to satisfy. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Movement", meta = (ClampMin = "0.5", ClampMax = "1.0"))
+	float WallRunLineUpDot;
+
+	/** Longest the bot will spend turning onto its travel direction before giving the attempt up. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Movement", meta = (ClampMin = "0.05"))
+	float WallRunLineUpMaxTime;
+
+	/** How long the bot holds its yaw after jumping at a wall, waiting for the movement component to attach.
+	 *  Roughly the airtime between clearing WallRunMaxStartVerticalSpeed and landing again. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Movement", meta = (ClampMin = "0.05"))
 	float WallRunCommitTime;
 
@@ -108,14 +180,19 @@ protected:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Movement", meta = (ClampMin = "0.0"))
 	float WallRunAttemptInterval;
 
-	/** Fraction of a wall run's expected duration after which the bot jumps off rather than sliding down.
-	 *  Ending a run with a wall jump is the whole reason to be on the wall, so this defaults high. */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Movement", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-	float WallJumpAtRunFraction;
+	/** How far into a wall run the bot jumps off. Ending a run with a wall jump is the whole reason to be on
+	 *  the wall, so this sits well inside the character's WallRunMaxDuration. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Movement", meta = (ClampMin = "0.05"))
+	float WallJumpAfterTime;
+
+	/** The bot will not start a wall run when its destination is nearer than this - a wall run that ends past
+	 *  the goal costs more than it saves. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Movement", meta = (ClampMin = "0.0"))
+	float WallRunMinGoalDistance;
 
 	// --- Jumping ----------------------------------------------------------------------------------
 
-	/** Evasive jumps while engaging. Off makes the bot a much easier target - it is the main reason a
+	/** Evasive jumps while fighting. Off makes the bot a much easier target - it is the main reason a
 	 *  Veteran bot is hard to track. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FPS|AI|Movement")
 	bool bJumpDodge;
@@ -128,12 +205,19 @@ protected:
 private:
 	AShooterAIController* GetAIController() const;
 	AShooterCharacter* GetShooterPawn() const;
+	UShooterAIBlackboard* GetBlackboard() const;
 	UShooterMovementComponent* GetShooterMovement() const;
 
-	void UpdateSprint();
+	void UpdateSprint(float DeltaTime);
 	void UpdateSlide(float DeltaTime);
 	void UpdateWallRun(float DeltaTime);
 	void UpdateJump(float DeltaTime);
+
+	/** Ends the current wall-run action, releases the yaw and starts the attempt cooldown. */
+	void AbortWallRun();
+
+	/** Looks for a runnable wall alongside the current route. Sets TechAction to WallRunLineUp on success. */
+	void TryBeginWallRun();
 
 	/** Single-frame jump press. ACharacter::Jump latches bPressedJump, and CheckJumpInput will happily spend
 	 *  the air jump on the very next frame while it is still held - which would burn the double jump
@@ -142,16 +226,41 @@ private:
 	void PressJump();
 	void ReleaseJumpIfPending();
 
-	/** Sideways probe for a wall worth running. True only for a near-vertical surface within range. */
-	bool ProbeForWall(bool bRightSide, FHitResult& OutHit) const;
+	/**
+	 * Probe perpendicular to Travel for a wall worth running. True only for a near-vertical surface, within
+	 * range, that is roughly parallel to the direction of travel.
+	 */
+	bool ProbeForWall(const FVector& Travel, bool bRightSide, FHitResult& OutHit) const;
 
 	bool RollTechChance() const;
 
-	float SlideCheckTimer;
+	// --- Committed wall-run action ---
+	EShooterTechAction TechAction;
+
+	/** Time spent in the current TechAction phase. */
+	float TechPhaseTime;
+
+	/** Cooldown before another wall-run opportunity is even looked for. */
 	float WallRunAttemptTimer;
-	float WallRunCommitTimer;
+
+	/** Rolled once at attach so the bot either commits to the wall jump exit or does not, rather than
+	 *  re-rolling it every frame of the run. */
+	bool bWallJumpPlanned;
+
+	/** Side the probe found the wall on, kept so line-up can keep re-checking the same side. */
+	bool bWallOnRight;
+
+	// --- Sprint ---
+	bool bSprintIntent;
+	float SprintHoldTime;
+
+	/** True while the bot is deliberately sprinting to buy the speed an evasive slide needs. */
+	bool bEvadeSprintActive;
+	float EvadeSprintTimer;
+
+	// --- Other tech timers ---
+	float SlideCheckTimer;
 	float JumpDodgeTimer;
 	float StuckTimer;
 	bool bJumpPressedLastTick;
-	bool bWallRunJumpQueued;
 };

@@ -3,43 +3,60 @@
 
 #include "AI/ShooterAIMovementTechComponent.h"
 
+#include "AI/ShooterAIBlackboard.h"
 #include "AI/ShooterAIController.h"
 #include "Character/ShooterCharacter.h"
 #include "Character/ShooterMovementComponent.h"
 #include "Components/CapsuleComponent.h"
+#include "DrawDebugHelpers.h"
 #include "Engine/World.h"
 
 UShooterAIMovementTechComponent::UShooterAIMovementTechComponent()
 {
-	// Ticked by hand from AShooterAIController::Tick, before the aim component, so a wall-run attempt can
-	// claim the yaw for the frame before aim writes the control rotation.
+	// Ticked by hand from AShooterAIController::Tick, before the aim component, so a traversal yaw claim is
+	// raised before aim writes the control rotation for the frame.
 	PrimaryComponentTick.bCanEverTick = false;
 
 	SprintMinGoalDistance = 500.f;
+	SprintMinHoldTime = 0.4f;
 
 	SlideAttemptMinSpeed = 550.f;
 	SlideApproachDistanceMin = 250.f;
 	SlideApproachDistanceMax = 900.f;
 	bSlideToEvade = true;
+	SlideSprintPrimeTime = 0.45f;
 
 	bAllowWallRun = true;
-	WallProbeDistance = 90.f;
+	// Just inside the character's WallRunTraceDistance of 75 - see the note on the property.
+	WallProbeDistance = 68.f;
 	WallRunAttemptMinSpeed = 450.f;
 	WallProbeMaxNormalZ = 0.25f;
-	WallRunCommitTime = 0.6f;
+	WallProbeMaxTravelDot = 0.5f;
+	WallRunLineUpDot = 0.85f;
+	WallRunLineUpMaxTime = 0.6f;
+	WallRunCommitTime = 0.7f;
 	WallRunAttemptInterval = 2.f;
-	WallJumpAtRunFraction = 0.7f;
+	WallJumpAfterTime = 0.55f;
+	WallRunMinGoalDistance = 400.f;
 
 	bJumpDodge = true;
 	StuckTimeBeforeJump = 0.4f;
 
-	SlideCheckTimer = 0.f;
+	TechAction = EShooterTechAction::None;
+	TechPhaseTime = 0.f;
 	WallRunAttemptTimer = 0.f;
-	WallRunCommitTimer = 0.f;
+	bWallJumpPlanned = false;
+	bWallOnRight = true;
+
+	bSprintIntent = false;
+	SprintHoldTime = 0.f;
+	bEvadeSprintActive = false;
+	EvadeSprintTimer = 0.f;
+
+	SlideCheckTimer = 0.f;
 	JumpDodgeTimer = 0.f;
 	StuckTimer = 0.f;
 	bJumpPressedLastTick = false;
-	bWallRunJumpQueued = false;
 }
 
 AShooterAIController* UShooterAIMovementTechComponent::GetAIController() const
@@ -51,6 +68,12 @@ AShooterCharacter* UShooterAIMovementTechComponent::GetShooterPawn() const
 {
 	const AShooterAIController* AI = GetAIController();
 	return IsValid(AI) ? AI->GetShooterPawn() : nullptr;
+}
+
+UShooterAIBlackboard* UShooterAIMovementTechComponent::GetBlackboard() const
+{
+	const AShooterAIController* AI = GetAIController();
+	return IsValid(AI) ? AI->GetKnowledge() : nullptr;
 }
 
 UShooterMovementComponent* UShooterAIMovementTechComponent::GetShooterMovement() const
@@ -84,12 +107,25 @@ void UShooterAIMovementTechComponent::ResetTech()
 		MoveComp->SetWantsToSprint(false);
 	}
 
-	SlideCheckTimer = 0.f;
+	if (AShooterAIController* AI = GetAIController())
+	{
+		AI->ReleaseTravelYawClaim();
+		AI->SetFireSuppressed(false);
+	}
+
+	TechAction = EShooterTechAction::None;
+	TechPhaseTime = 0.f;
 	WallRunAttemptTimer = 0.f;
-	WallRunCommitTimer = 0.f;
+	bWallJumpPlanned = false;
+
+	bSprintIntent = false;
+	SprintHoldTime = 0.f;
+	bEvadeSprintActive = false;
+	EvadeSprintTimer = 0.f;
+
+	SlideCheckTimer = 0.f;
 	JumpDodgeTimer = 0.f;
 	StuckTimer = 0.f;
-	bWallRunJumpQueued = false;
 }
 
 bool UShooterAIMovementTechComponent::RollTechChance() const
@@ -106,38 +142,72 @@ void UShooterAIMovementTechComponent::TickMovementTech(float DeltaTime)
 
 	ReleaseJumpIfPending();
 
-	UpdateSprint();
-	UpdateSlide(DeltaTime);
+	// Wall run first: it is the only tech that claims the yaw, and both the slide and the jump layers have to
+	// know to stay out of its way this frame.
 	UpdateWallRun(DeltaTime);
+	UpdateSprint(DeltaTime);
+	UpdateSlide(DeltaTime);
 	UpdateJump(DeltaTime);
 }
 
 /* --- Sprint --- */
 
-void UShooterAIMovementTechComponent::UpdateSprint()
+void UShooterAIMovementTechComponent::UpdateSprint(float DeltaTime)
 {
 	const AShooterAIController* AI = GetAIController();
 	UShooterMovementComponent* MoveComp = GetShooterMovement();
 	const AShooterCharacter* Bot = GetShooterPawn();
 	if (!IsValid(AI) || !IsValid(MoveComp) || !IsValid(Bot)) return;
 
+	SprintHoldTime += DeltaTime;
+
+	// The fire path calls IPlayerInterface::CancelSprint, which clears bWantsToSprint underneath this
+	// component. Treat that as the authority rather than re-asserting on the next frame.
+	//
+	// This is not cosmetic. UCombatComponent::Local_FireWeapon returns early on IsOwnerSprinting(), so a bot
+	// that re-asserts sprint the frame after the trigger cancelled it presses the trigger and drops every
+	// round - for as long as the hold window lasts. Gating only the intent *flip* and not the *write* left
+	// exactly that hole open.
+	//
+	// Not applied during an evasive slide prime: the burst is a deliberate, bounded claim on the sprint flag,
+	// and the trigger is suppressed for its duration so nothing is competing for it anyway.
+	if (bSprintIntent && !MoveComp->WantsToSprint() && !bEvadeSprintActive)
+	{
+		bSprintIntent = false;
+		SprintHoldTime = 0.f;
+		return;
+	}
+
 	// Sprinting blocks firing. That single rule is what makes this decision tactical rather than cosmetic:
 	// the bot has to choose between covering ground and being able to shoot, exactly as the player does. So
 	// anything it could shoot at right now beats any distance it might close.
-	const bool bCouldShoot = AI->HasAcquiredTarget() && AI->HasLineOfSight();
+	//
+	// Read off WantsToShoot rather than off the tactical action, because the trigger is no longer tied to the
+	// action - the aim layer will take a shot during an approach.
+	//
+	// Only ever true while *pathing*. A steering bot is fighting at close range, where the trigger is worth
+	// more than the speed; the one exception is the sprint-to-slide below, which buys its own.
+	bool bWantSprint =
+		!AI->WantsToShoot() &&
+		AI->HasMoveGoal() &&
+		AI->GetDistanceToMoveGoal() > SprintMinGoalDistance &&
+		TechAction != EShooterTechAction::WallRunActive;
 
-	bool bWantSprint = false;
-	if (!bCouldShoot && AI->HasMoveGoal())
+	// An evasive slide has to reach SlideMinStartSpeed first, and it outranks the shooting veto - that is
+	// exactly the trade a player makes when they sprint-cancel into a slide mid-duel. Bounded by
+	// SlideSprintPrimeTime so it can never become a bot that just runs around not shooting.
+	if (bEvadeSprintActive)
 	{
-		const float DistanceToGoal = FVector::Dist(Bot->GetActorLocation(), AI->GetMoveGoal());
-		bWantSprint = DistanceToGoal > SprintMinGoalDistance;
+		bWantSprint = true;
 	}
 
-	// Only written on a change. SetWantsToSprint(false) clears the predicted sprint flag outright, so
-	// hammering it every frame would fight the movement component's own state rather than express intent.
-	if (bWantSprint != MoveComp->WantsToSprint())
+	// Committed for at least SprintMinHoldTime, and - crucially - the write is inside the same gate as the
+	// flip, so the flag is only ever touched on a deliberate change of mind.
+	if (bWantSprint != bSprintIntent && (SprintHoldTime >= SprintMinHoldTime || bEvadeSprintActive))
 	{
-		MoveComp->SetWantsToSprint(bWantSprint);
+		bSprintIntent = bWantSprint;
+		SprintHoldTime = 0.f;
+		MoveComp->SetWantsToSprint(bSprintIntent);
 	}
 }
 
@@ -145,40 +215,83 @@ void UShooterAIMovementTechComponent::UpdateSprint()
 
 void UShooterAIMovementTechComponent::UpdateSlide(float DeltaTime)
 {
-	const AShooterAIController* AI = GetAIController();
+	AShooterAIController* AI = GetAIController();
 	UShooterMovementComponent* MoveComp = GetShooterMovement();
-	const AShooterCharacter* Bot = GetShooterPawn();
-	if (!IsValid(AI) || !IsValid(MoveComp) || !IsValid(Bot)) return;
+	if (!IsValid(AI) || !IsValid(MoveComp)) return;
+
+	// --- Sprint-to-slide burst, handled ahead of the throttle because it has to run every frame.
+	//
+	// A slide needs sprint (CanStartSlide gates on bSprinting) and sprint blocks firing, so a bot fighting at
+	// close range can never slide by accident - it has to *choose* to stop shooting for a beat and buy the
+	// speed. That is the same commitment a player makes, and expressing it as a short bounded burst is what
+	// keeps in-fight slides available now that a steering bot has no move goal to sprint toward.
+	if (bEvadeSprintActive)
+	{
+		EvadeSprintTimer -= DeltaTime;
+
+		const bool bReady =
+			MoveComp->IsMovingOnGround() &&
+			MoveComp->IsSprinting() &&
+			MoveComp->Velocity.Size2D() >= SlideAttemptMinSpeed;
+
+		if (bReady)
+		{
+			// Intent only. CanStartSlide still applies the real speed floor, the ground check and
+			// SlideCooldown - this cannot force a slide the player could not have started.
+			MoveComp->RequestSlide();
+			bEvadeSprintActive = false;
+		}
+		else if (EvadeSprintTimer <= 0.f || MoveComp->IsSliding() || MoveComp->IsWallRunning())
+		{
+			bEvadeSprintActive = false;
+		}
+
+		if (!bEvadeSprintActive)
+		{
+			// The slide itself clears bWantsToSprint inside EnterSlide, so the trigger is free again the
+			// moment the bot is actually sliding - firing while sliding is allowed and always was.
+			AI->SetFireSuppressed(false);
+		}
+		return;
+	}
 
 	SlideCheckTimer -= DeltaTime;
 	if (SlideCheckTimer > 0.f) return;
 	SlideCheckTimer = AI->GetDifficulty().SlideCheckInterval;
 
+	// A wall run in progress owns the bot's movement for its duration; a slide would cancel the line-up or
+	// drop it off the wall.
+	if (TechAction != EShooterTechAction::None) return;
+
 	if (MoveComp->IsSliding() || MoveComp->IsWallRunning()) return;
 	if (!MoveComp->IsMovingOnGround()) return;
+
+	// --- Steering, i.e. fighting at close range. There is no move goal to sprint toward, so an evasive slide
+	// has to prime its own speed first. This is the branch that keeps slides in firefights.
+	if (AI->IsSteering())
+	{
+		if (!bSlideToEvade) return;
+		if (!AI->HasLineOfSight()) return;
+		if (!RollTechChance()) return;
+
+		bEvadeSprintActive = true;
+		EvadeSprintTimer = SlideSprintPrimeTime;
+		AI->SetFireSuppressed(true);
+		return;
+	}
+
+	// --- Pathing. The bot is already sprinting toward somewhere, so the slide is free.
 	if (!MoveComp->IsSprinting()) return;
 	if (MoveComp->Velocity.Size2D() < SlideAttemptMinSpeed) return;
 
-	// Two reasons to slide, both of which a good player would recognise.
-	bool bWantSlide = false;
+	// Slide into the destination. Arriving in a slide is faster than arriving in a sprint and ends with the
+	// bot low and already able to shoot, because entering a slide releases the sprint that was blocking its
+	// trigger.
+	if (!AI->HasMoveGoal()) return;
 
-	// One: slide into the destination. Arriving in a slide is faster than arriving in a sprint and ends with
-	// the bot low and already able to shoot, because entering a slide releases the sprint that was blocking
-	// its trigger.
-	if (AI->HasMoveGoal())
-	{
-		const float DistanceToGoal = FVector::Dist(Bot->GetActorLocation(), AI->GetMoveGoal());
-		bWantSlide = DistanceToGoal >= SlideApproachDistanceMin && DistanceToGoal <= SlideApproachDistanceMax;
-	}
+	const float DistanceToGoal = AI->GetDistanceToMoveGoal();
+	if (DistanceToGoal < SlideApproachDistanceMin || DistanceToGoal > SlideApproachDistanceMax) return;
 
-	// Two: slide to evade. Crossing open ground while the target can see it is the worst place to be running
-	// in a straight line, and a slide both changes its silhouette and moves it faster than sprint.
-	if (!bWantSlide && bSlideToEvade && AI->HasLineOfSight())
-	{
-		bWantSlide = true;
-	}
-
-	if (!bWantSlide) return;
 	if (!RollTechChance()) return;
 
 	// Intent only. CanStartSlide inside the movement component still applies the real speed floor, the ground
@@ -188,7 +301,7 @@ void UShooterAIMovementTechComponent::UpdateSlide(float DeltaTime)
 
 /* --- Wall run --- */
 
-bool UShooterAIMovementTechComponent::ProbeForWall(bool bRightSide, FHitResult& OutHit) const
+bool UShooterAIMovementTechComponent::ProbeForWall(const FVector& Travel, bool bRightSide, FHitResult& OutHit) const
 {
 	const AShooterCharacter* Bot = GetShooterPawn();
 	if (!IsValid(Bot) || !IsValid(GetWorld())) return false;
@@ -196,112 +309,208 @@ bool UShooterAIMovementTechComponent::ProbeForWall(bool bRightSide, FHitResult& 
 	const UCapsuleComponent* Capsule = Bot->GetCapsuleComponent();
 	if (!IsValid(Capsule)) return false;
 
+	const FVector TravelDirection = Travel.GetSafeNormal2D();
+	if (TravelDirection.IsNearlyZero()) return false;
+
+	// Perpendicular to *travel*, not to the capsule's facing. Up x Forward is UE's right-hand convention, so
+	// this matches the vector UShooterMovementComponent::FindRunnableWall will use once the yaw has been
+	// lined up onto travel - which is the whole point of the line-up phase.
+	FVector Side = FVector::CrossProduct(FVector::UpVector, TravelDirection).GetSafeNormal();
+	if (!bRightSide)
+	{
+		Side *= -1.f;
+	}
+
 	const FVector Start = Capsule->GetComponentLocation();
-	const FVector Direction = bRightSide ? Capsule->GetRightVector() : -Capsule->GetRightVector();
-	const FVector End = Start + Direction * WallProbeDistance;
+	const FVector End = Start + Side * WallProbeDistance;
 
 	FCollisionQueryParams Params(SCENE_QUERY_STAT(BotWallProbe), false, Bot);
 	if (!GetWorld()->LineTraceSingleByChannel(OutHit, Start, End, ECC_Visibility, Params)) return false;
 
-	// Same rejection the movement component applies - floors, ceilings and steep ramps are not walls. Probing
-	// on the same channel and with the same normal test is what keeps the bot from committing to a surface
-	// UShooterMovementComponent::FindRunnableWall would then refuse.
-	return FMath::Abs(OutHit.ImpactNormal.Z) <= WallProbeMaxNormalZ;
+	// Same rejection the movement component applies - floors, ceilings and steep ramps are not walls.
+	if (FMath::Abs(OutHit.ImpactNormal.Z) > WallProbeMaxNormalZ) return false;
+
+	// And the check the old probe was missing: the surface has to run *alongside* the route. A wall the bot
+	// is about to hit head-on passes every other test and produces a jump into a dead stop.
+	if (FMath::Abs(OutHit.ImpactNormal | TravelDirection) > WallProbeMaxTravelDot) return false;
+
+	return true;
 }
 
 void UShooterAIMovementTechComponent::UpdateWallRun(float DeltaTime)
 {
-	const AShooterAIController* AI = GetAIController();
+	AShooterAIController* AI = GetAIController();
 	UShooterMovementComponent* MoveComp = GetShooterMovement();
-	AShooterCharacter* Bot = GetShooterPawn();
-	if (!IsValid(AI) || !IsValid(MoveComp) || !IsValid(Bot)) return;
+	if (!IsValid(AI) || !IsValid(MoveComp)) return;
 
 	WallRunAttemptTimer = FMath::Max(0.f, WallRunAttemptTimer - DeltaTime);
-	WallRunCommitTimer = FMath::Max(0.f, WallRunCommitTimer - DeltaTime);
 
 	if (!bAllowWallRun)
 	{
-		WallRunCommitTimer = 0.f;
+		if (TechAction != EShooterTechAction::None)
+		{
+			AbortWallRun();
+		}
 		return;
 	}
 
-	// --- Already on a wall: hold the yaw, and leave with a wall jump rather than sliding off the end. ---
+	// Only runs while an attempt is actually in flight, so the debug readout is the age of the current phase
+	// rather than the age of the bot.
+	if (TechAction == EShooterTechAction::None && !MoveComp->IsWallRunning())
+	{
+		TechPhaseTime = 0.f;
+	}
+	else
+	{
+		TechPhaseTime += DeltaTime;
+	}
+
+	// --- Attached. The yaw claim is forced from here on: PhysWallRun derives its along-wall direction from
+	// the capsule's forward vector, so releasing the yaw mid-run does not return the bot's aim to the player,
+	// it drops the bot off the wall. The run is already bounded by the character's WallRunMaxDuration.
 	if (MoveComp->IsWallRunning())
 	{
-		// Keeps the yaw claimed for the whole run. PhysWallRun flips its along-wall direction to match the
-		// capsule's forward vector and bleeds speed unless input points along it, so letting the bot turn
-		// back to its target mid-run would stall the run rather than merely look wrong.
-		WallRunCommitTimer = FMath::Max(WallRunCommitTimer, 0.1f);
-
-		if (!bWallRunJumpQueued && RollTechChance())
+		if (TechAction != EShooterTechAction::WallRunActive)
 		{
-			bWallRunJumpQueued = true;
+			TechAction = EShooterTechAction::WallRunActive;
+			TechPhaseTime = 0.f;
+			bWallJumpPlanned = RollTechChance();
 		}
+
+		// Velocity while attached is already along the wall, so it is the most accurate travel direction
+		// available - more so than path-following input, which is aiming at a goal past the wall.
+		AI->RequestTravelYawClaim(MoveComp->Velocity.GetSafeNormal2D(), /*bForce*/ true);
 
 		// The wall jump is the payoff for being on the wall at all - it is the only exit that keeps the
 		// momentum. UShooterMovementComponent::DoJump routes a jump made while wall running into TryWallJump,
 		// so this is a plain jump press.
-		if (bWallRunJumpQueued && WallRunCommitTimer <= 0.15f)
+		if (bWallJumpPlanned && TechPhaseTime >= WallJumpAfterTime)
 		{
 			PressJump();
-			bWallRunJumpQueued = false;
+			bWallJumpPlanned = false;
 		}
 		return;
 	}
 
-	// --- Mid-attempt: airborne, heading at a wall, waiting for the movement component to attach. ---
-	if (WallRunCommitTimer > 0.f)
+	// Left the wall (jumped off, timed out, or lost it). Start the cooldown so the bot does not immediately
+	// re-commit to the same surface.
+	if (TechAction == EShooterTechAction::WallRunActive)
 	{
-		// Nothing to drive: the attach test runs inside the movement component's own update every frame. All
-		// the bot has to do is keep facing along its travel direction until it succeeds or the window closes,
-		// and WantsYawLockedToTravel is what delivers that.
+		AbortWallRun();
 		return;
 	}
 
-	// --- Look for a new opportunity. ---
+	// --- Lining up on the ground. This is the phase the old bot did not have, and its absence is why it
+	// never wall ran: it jumped first and turned afterwards, so the yaw arrived after the attach window had
+	// already closed.
+	if (TechAction == EShooterTechAction::WallRunLineUp)
+	{
+		const FVector Travel = GetTravelDirection();
+
+		// The claim is what actually turns the capsule, and it can be refused - the aim layer will not let
+		// locomotion look away from a live target by more than TraverseMaxLookAwayDegrees. A refusal is a
+		// clean abort, not a stall.
+		if (!AI->RequestTravelYawClaim(Travel, /*bForce*/ false))
+		{
+			AbortWallRun();
+			return;
+		}
+
+		FHitResult WallHit;
+		if (TechPhaseTime > WallRunLineUpMaxTime || !ProbeForWall(Travel, bWallOnRight, WallHit))
+		{
+			AbortWallRun();
+			return;
+		}
+
+		if (!AI->IsTravelYawAligned(WallRunLineUpDot)) return;
+
+		// Aligned and still beside the wall. Commit.
+		TechAction = EShooterTechAction::WallRunCommit;
+		TechPhaseTime = 0.f;
+
+		// A wall run needs the bot airborne and falling - TryStartWallRun refuses while grounded and while
+		// still rising faster than WallRunMaxStartVerticalSpeed. Jumping is how it gets there.
+		if (MoveComp->IsMovingOnGround())
+		{
+			PressJump();
+		}
+		return;
+	}
+
+	// --- Airborne, holding the yaw while the movement component's own attach test runs every frame. Nothing
+	// to drive here: all the bot has to do is keep facing along travel until it attaches or the window shuts.
+	if (TechAction == EShooterTechAction::WallRunCommit)
+	{
+		if (!AI->RequestTravelYawClaim(GetTravelDirection(), /*bForce*/ false) || TechPhaseTime > WallRunCommitTime)
+		{
+			AbortWallRun();
+		}
+		return;
+	}
+
+	TryBeginWallRun();
+}
+
+void UShooterAIMovementTechComponent::TryBeginWallRun()
+{
+	AShooterAIController* AI = GetAIController();
+	const UShooterMovementComponent* MoveComp = GetShooterMovement();
+	if (!IsValid(AI) || !IsValid(MoveComp)) return;
+
 	if (WallRunAttemptTimer > 0.f) return;
 
-	// Traversal states only. Wall running while engaging would cost the bot its aim for the length of the run
-	// (the yaw lock is what makes the run possible at all), which is a bad trade in a firefight.
-	const EShooterBotState State = AI->GetBotState();
-	if (State != EShooterBotState::Hunt && State != EShooterBotState::Reposition && State != EShooterBotState::Retreat)
-	{
-		return;
-	}
+	// Traversal actions only. Wall running mid-strafe would cost the bot its aim for the length of the run
+	// (the yaw claim is what makes the run possible at all), which is a bad trade inside a firefight.
+	// Approach is included on purpose - closing distance is exactly when a player would use the walls.
+	if (!IsShooterBotTraversalAction(AI->GetAction())) return;
 
-	if (MoveComp->IsSliding()) return;
+	if (!AI->HasMoveGoal()) return;
+	if (AI->GetDistanceToMoveGoal() < WallRunMinGoalDistance) return;
+
+	if (MoveComp->IsSliding() || MoveComp->IsWallRunning()) return;
+	if (!MoveComp->IsMovingOnGround()) return;
 	if (MoveComp->Velocity.Size2D() < WallRunAttemptMinSpeed) return;
-	if (GetTravelDirection().IsNearlyZero()) return;
+
+	const FVector Travel = GetTravelDirection();
+	if (Travel.IsNearlyZero()) return;
 
 	FHitResult WallHit;
-	if (!ProbeForWall(true, WallHit) && !ProbeForWall(false, WallHit)) return;
+	bool bFoundRight = ProbeForWall(Travel, true, WallHit);
+	if (!bFoundRight && !ProbeForWall(Travel, false, WallHit)) return;
 
 	if (!RollTechChance())
 	{
-		// Rolled against it - don't re-roll every frame, or a high enough frame rate makes any chance
-		// certain within a few frames and MovementTechChance stops meaning anything.
+		// Rolled against it - don't re-roll every frame, or a high enough frame rate makes any chance certain
+		// within a few frames and MovementTechChance stops meaning anything.
 		WallRunAttemptTimer = WallRunAttemptInterval;
 		return;
 	}
 
-	WallRunAttemptTimer = WallRunAttemptInterval;
-	WallRunCommitTimer = WallRunCommitTime;
-
-	// A wall run needs the bot airborne and falling - TryStartWallRun refuses while grounded and while still
-	// rising faster than WallRunMaxStartVerticalSpeed. Jumping is how it gets there; the commit window above
-	// is what keeps it facing the right way long enough for the attach test to pass on the way up.
-	if (MoveComp->IsMovingOnGround())
+	// The aim layer gets the final word: no wall run may start by turning the bot away from a live target.
+	if (!AI->RequestTravelYawClaim(Travel, /*bForce*/ false))
 	{
-		PressJump();
+		WallRunAttemptTimer = WallRunAttemptInterval;
+		return;
 	}
+
+	bWallOnRight = bFoundRight;
+	TechAction = EShooterTechAction::WallRunLineUp;
+	TechPhaseTime = 0.f;
+	bWallJumpPlanned = false;
 }
 
-bool UShooterAIMovementTechComponent::WantsYawLockedToTravel() const
+void UShooterAIMovementTechComponent::AbortWallRun()
 {
-	const UShooterMovementComponent* MoveComp = GetShooterMovement();
-	if (!IsValid(MoveComp)) return false;
+	if (AShooterAIController* AI = GetAIController())
+	{
+		AI->ReleaseTravelYawClaim();
+	}
 
-	return MoveComp->IsWallRunning() || WallRunCommitTimer > 0.f;
+	TechAction = EShooterTechAction::None;
+	TechPhaseTime = 0.f;
+	bWallJumpPlanned = false;
+	WallRunAttemptTimer = WallRunAttemptInterval;
 }
 
 /* --- Jumping --- */
@@ -310,12 +519,11 @@ void UShooterAIMovementTechComponent::UpdateJump(float DeltaTime)
 {
 	const AShooterAIController* AI = GetAIController();
 	const UShooterMovementComponent* MoveComp = GetShooterMovement();
-	const AShooterCharacter* Bot = GetShooterPawn();
-	if (!IsValid(AI) || !IsValid(MoveComp) || !IsValid(Bot)) return;
+	if (!IsValid(AI) || !IsValid(MoveComp)) return;
 
-	// A wall-run attempt owns the jump for its window - spending it on a dodge here would waste the air jump
-	// the attach is relying on.
-	if (WallRunCommitTimer > 0.f || MoveComp->IsWallRunning()) return;
+	// A wall-run action owns the jump for its whole duration - spending it on a dodge here would burn the air
+	// jump the attach is relying on.
+	if (TechAction != EShooterTechAction::None || MoveComp->IsWallRunning()) return;
 
 	// --- Unstick. The nav mesh will happily route the bot at a ledge or a lip its capsule cannot step over;
 	// this is what gets it across. Detected as "asking to move and barely moving" rather than by geometry,
@@ -346,7 +554,7 @@ void UShooterAIMovementTechComponent::UpdateJump(float DeltaTime)
 	if (JumpDodgeTimer > 0.f) return;
 	JumpDodgeTimer = AI->GetDifficulty().JumpDodgeInterval;
 
-	if (AI->GetBotState() != EShooterBotState::Engage) return;
+	if (!IsShooterBotFightingAction(AI->GetAction())) return;
 	if (!AI->HasLineOfSight()) return;
 	if (!RollTechChance()) return;
 
@@ -382,4 +590,43 @@ void UShooterAIMovementTechComponent::ReleaseJumpIfPending()
 	}
 
 	bJumpPressedLastTick = false;
+}
+
+/* --- Debug --- */
+
+void UShooterAIMovementTechComponent::DrawTechDebug() const
+{
+	const AShooterAIController* AI = GetAIController();
+	const AShooterCharacter* Bot = GetShooterPawn();
+	if (!IsValid(AI) || !IsValid(Bot) || !IsValid(GetWorld())) return;
+
+	static const TCHAR* TechNames[] = { TEXT("-"), TEXT("LineUp"), TEXT("Commit"), TEXT("Active") };
+	const int32 TechIndex = static_cast<int32>(TechAction);
+
+	DrawDebugString(GetWorld(), FVector(0.f, 0.f, 100.f),
+		FString::Printf(TEXT("tech %s %.2fs | cd %.1fs%s"),
+			TechIndex < UE_ARRAY_COUNT(TechNames) ? TechNames[TechIndex] : TEXT("?"),
+			TechPhaseTime,
+			WallRunAttemptTimer,
+			bSprintIntent ? TEXT(" | sprint") : TEXT("")),
+		const_cast<AShooterCharacter*>(Bot), FColor::Silver, 0.f, true);
+
+	// Both wall probes, drawn live. Green means a runnable surface: if these are never green while the bot
+	// runs past a wall, the problem is WallProbeDistance or WallProbeMaxTravelDot, not the decision logic.
+	const UCapsuleComponent* Capsule = Bot->GetCapsuleComponent();
+	const FVector Travel = GetTravelDirection();
+	if (IsValid(Capsule) && !Travel.IsNearlyZero())
+	{
+		const FVector Start = Capsule->GetComponentLocation();
+		const FVector Side = FVector::CrossProduct(FVector::UpVector, Travel).GetSafeNormal();
+
+		FHitResult Probe;
+		for (int32 Index = 0; Index < 2; ++Index)
+		{
+			const bool bRight = (Index == 0);
+			const FVector End = Start + (bRight ? Side : -Side) * WallProbeDistance;
+			const bool bHit = ProbeForWall(Travel, bRight, Probe);
+			DrawDebugLine(GetWorld(), Start, End, bHit ? FColor::Green : FColor::Blue, false, -1.f, 0, 2.f);
+		}
+	}
 }
