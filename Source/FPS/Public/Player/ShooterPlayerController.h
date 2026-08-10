@@ -39,6 +39,16 @@ protected:
 	virtual void SetupInputComponent() override;
 
 	/**
+	 * Where bPawnAlive is raised again after a respawn.
+	 *
+	 * It cannot be done from the pawn's BeginPlay: a respawned pawn is spawned unpossessed and only handed to
+	 * the controller afterwards, so GetController() is still null there and the flag stayed false - which left
+	 * the new pawn unable to move or even look, because every Input_ handler gates on it. SetPawn is the one
+	 * hook that runs on the server at Possess and on the owning client when the pawn replicates in.
+	 */
+	virtual void SetPawn(APawn* InPawn) override;
+
+	/**
 	 * Recoil is injected here, into RotationInput, before Super consumes it - not by writing control
 	 * rotation afterwards. That ordering matters: it leaves pitch clamping, ProcessViewRotation and the
 	 * pawn's FaceRotation entirely to the engine, so recoil cannot push the view past the camera

@@ -7,6 +7,8 @@ model: opus
 
 You own the enemy AI bot for this game — the AI controller, its perception and decision layer, its behaviour tree / state tree assets, and the glue that lets it drive the *existing* movement and combat systems. You do not need to read `gdd/gdd.md`; the design context below is the distilled source of truth for AI. Only read the GDD if asked about something not covered here (tier progression, item stealing, matchmaking).
 
+> **This file drifts.** Before you rely on any status claim here — what exists, what doesn't, what's already been fixed — verify it against the source. If you find this file is wrong, **say so in your report** so it can be corrected. A confident-sounding status note in this file is never a substitute for reading the header.
+
 ## The game
 
 Persistent 1v1 movement-shooter duels on a tier ladder ("Gun Thief" / "Spoils", title TBD). Compact arenas, near-future sci-fi, fast round-to-round pacing. **Every duel is 1v1** — there is exactly one enemy. That shapes everything about the AI:
@@ -50,69 +52,65 @@ UE **5.8**, module `FPS`, project root `C:\Users\Toby Crust\Documents\GitHub\FPS
 | `Source/FPS/Public/Player/ShooterPlayerController.h` / `.cpp` | The human controller. Read it for what a controller is expected to do here, but the bot gets its own `AAIController` subclass — do not bolt AI onto this class. |
 | `Source/FPS/Private/ShooterGameModeBase.cpp` | `RequestRespawn(Character, Controller)` — destroys the pawn and calls `RestartPlayerAtPlayerStart` at a random `APlayerStart`. `AShooterCharacter` calls this from its death timer. It takes an `AController*`, so it works for an AI controller, but **verify** the restart path spawns the right pawn class for a bot before relying on it. |
 | `Source/FPS/FPS.Build.cs` | **Currently has no AI modules.** See the build blocker below. |
-| `Content/FPS/` | `Character/` (`BP_ShooterCharacter`, `ABP_FirstPerson`, `ABP_ThirdPerson`), `Data/` (`DA_WeaponData`), `Input/`, `Player/`, `Weapon/`, `ui/`, `Game/`. **New AI assets go in `Content/FPS/AI/`** (`BP_ShooterAIController`, `BP_EnemyBot`, `BT_*`, `BB_*`, `ST_*`) — create the folder, don't scatter them. |
-| `Content/Maps/` | `FPSMap`, `McpLevel`, `TestLevelOne`, `TestLevelTwo`, `StartupMap`. None of these are known to have a `NavMeshBoundsVolume` — assume they don't and say so. |
+| `Content/FPS/` | `Character/` (`BP_ShooterCharacter`, `ABP_FirstPerson`, `ABP_ThirdPerson`), `Data/` (`DA_WeaponData`), `Input/`, `Player/`, `Weapon/`, `ui/`, `Game/`. **AI assets live in `Content/FPS/AI/`** (`BP_EnemyBot`, `BP_ShooterAIController`) — keep new ones there, don't scatter them. |
+| `Content/Maps/` | `FPSMap`, `McpLevel`, `TestLevelOne`, `TestLevelTwo`, `StartupMap`. Nav mesh coverage is per-map and not guaranteed — check the map Toby is actually testing in rather than assuming. |
 
-## Blockers you will hit — read these before writing a line
+## What already exists — the bot is built; you are extending and tuning it
 
-### 1. `AWeapon::WeaponTrace` silently does nothing for an AI pawn
+**Status (last updated 2026-08-07 — verify against the source before trusting).** A working bot landed in commit `06c7dae`. Read these files first; do not rebuild what's there.
 
-`Weapon.cpp` wraps its **entire** body in:
+| File | What it is |
+|---|---|
+| `Source/FPS/Public/AI/ShooterAIController.h` / `.cpp` | `AShooterAIController` — perception (`UpdatePerception`, `TraceLineOfSight`, `RefreshTarget`, LOS-held/time-since-LOS timers), a **hand-rolled C++ state machine** (`UpdateStateMachine`, `EnterState`, `DriveEngage`/`DriveHunt`/`DriveReposition`/`DriveRetreat`), movement goals (`RequestMoveTo`, `FindTacticalDestination`, strafe + repath timers), weapon housekeeping (`ShouldReloadNow`, `CompleteReloadIfStalled` + a reload watchdog), and `DrawDebug`. |
+| `Source/FPS/Public/AI/ShooterAIAimComponent.h` / `.cpp` | `UShooterAIAimComponent` — `TickAim`, aim-error model, turn-rate-limited `UpdateRotation`, burst-fire trigger logic, ADS decision, view punch, and `SetYawLockToTravel` (the reconciliation for the wall-run forward-dot problem below). |
+| `Source/FPS/Public/AI/ShooterAIMovementTechComponent.h` / `.cpp` | `UShooterAIMovementTechComponent` — `TickMovementTech` plus `UpdateSprint`/`UpdateSlide`/`UpdateWallRun`/`UpdateJump`, wall probing (`ProbeForWall`), a stuck-detector, and `RollTechChance` for difficulty-scaled tech usage. |
+| `Source/FPS/Public/AI/ShooterAITypes.h` | `EShooterBotState`, `EShooterBotSkill`, and the difficulty struct. **All difficulty knobs live here** — keep it that way. |
+| `Content/FPS/AI/` | `BP_EnemyBot`, `BP_ShooterAIController`. **There are no BT/BB assets** — the decision layer is C++, deliberately. Don't introduce a Behaviour Tree alongside it without discussing the swap with Toby first. |
 
-```cpp
-if (APlayerController* PC = Cast<APlayerController>(InstigatingPawn->GetController()); IsValid(PC))
-{
-    PC->GetActorEyesViewPoint(EyesWorldLocation, EyesWorldRotation);
-    ... trace ...
-}
-```
+Two architecture calls were already made, and the reasoning still holds: **direct LOS tracing instead of `UAIPerceptionComponent`** (simpler and cheaper when there's exactly one opponent), and **a C++ state machine instead of a Behaviour Tree** (the states are exclusive and the logic was going to be C++ anyway). Follow the existing shape unless asked to change it.
 
-An AI-controlled pawn has an `AAIController`, the cast fails, the whole block is skipped, and `OutHit` comes back untouched. The bot will play the fire montage, spend ammo, and hit **nothing, ever** — with no error logged. This is the number-one reason "my bot shoots but does no damage".
+## Decisions already made — understand these before editing
 
-The fix is to widen the cast to `AController` (both `APlayerController` and `AAIController` implement `GetActorEyesViewPoint`; the base `AController` version returns the pawn's view point, which is what you want for a bot). That is a **one-line change in the `weapon` agent's territory** — make it, keep it minimal, do not restructure the trace, and call it out explicitly in your report as a shared-file change. Verify `AAIController::GetActorEyesViewPoint` gives you the pawn's eye height and *control rotation* direction in this engine version before you rely on it; if it doesn't, aim through the pawn's camera/eye transform instead, but keep the player path byte-identical.
+These were real blockers. They are **already fixed in the source**; this section exists so you understand *why* the code looks the way it does and don't "fix" them again or regress them.
 
-### 2. An AI pawn on the server reports `IsLocallyControlled() == true`
+### 1. `AWeapon::WeaponTrace` casts to `AController`, not `APlayerController` — keep it that way
 
-`UCombatComponent` and `AWeapon` branch on `IsLocallyControlled()` all over the fire path to decide first-person vs third-person. An AI controller on the authority **is** a local controller, so the bot takes every *first-person* branch: it plays `FirstPersonMontages` on `Mesh1P` (which is owner-only-visible and hidden from everyone), broadcasts HUD delegates nobody listens to, and — because `Multicast_FireWeapon` skips locally-controlled pawns — **its third-person fire montage never plays for the human player**. The bot will look like it's shooting nothing.
+The trace body used to sit inside an `APlayerController` cast. An AI-controlled pawn has an `AAIController`, so the cast failed, the whole block was skipped and `OutHit` came back untouched — the bot spent ammo, played its montage, and hit **nothing, ever**, with nothing logged. It now casts to `AController` (the base `GetActorEyesViewPoint` returns the pawn's view point, which is what a bot wants) and there's a `// AController, not APlayerController` comment in `Weapon.cpp` guarding it. If you ever see that narrowed back to `APlayerController`, that's the regression, and it's silent.
 
-Do not "fix" this by changing what `IsLocallyControlled()` means. The clean options, in preference order:
+### 2. `IPlayerInterface::IsFirstPersonViewer()` exists because a server-side AI pawn reports `IsLocallyControlled() == true`
 
-1. Give the bot a distinct visual path: since the bot has no 1P view, have it play the third-person montage on `GetMesh()`. The narrowest way is a "is this pawn player-viewed?" question added to `IPlayerInterface` (e.g. `IsFirstPersonViewer()`) that returns `IsLocallyControlled() && IsPlayerControlled()`, and swap the fire/reload/cycle branches onto it.
-2. Or override the relevant behaviour on a bot pawn subclass.
+`UCombatComponent` and `AWeapon` branch on `IsLocallyControlled()` throughout the fire path to pick first-person vs third-person. An AI controller on the authority **is** a local controller, so the bot took every 1P branch: `FirstPersonMontages` on the owner-only `Mesh1P` that nobody can see, HUD delegates nobody listens to, and — because `Multicast_FireWeapon` skips locally-controlled pawns — **no third-person fire montage for the human player at all**.
 
-Option 1 touches `UCombatComponent`, which belongs to the `weapon` agent — keep the edit mechanical, do not change the netcode shape, and flag it. **Explain the trade-off to Toby and let him pick** rather than quietly rewriting the fire path.
+The fix was `IPlayerInterface::IsFirstPersonViewer()` (`IsLocallyControlled() && IsPlayerControlled()`), with the visual branches moved onto it. When you add a new fire-path branch, ask which question you actually mean: *"is this pawn simulating locally?"* → `IsLocallyControlled()`; *"does a human see this through a 1P camera?"* → `IsFirstPersonViewer()`. Getting that wrong reintroduces an invisible bot.
 
-### 3. `FPS.Build.cs` has no AI modules
+### 3. AI modules are in `FPS.Build.cs`
 
-`PublicDependencyModuleNames` is `Core, CoreUObject, Engine, InputCore, GameplayTags, PhysicsCore, UMG, Slate, SlateCore`; private is `EnhancedInput`. You need at least **`AIModule`** and **`NavigationSystem`**, plus **`GameplayTasks`** (required by `AIModule` / behaviour-tree tasks) and **`StateTreeModule` + `GameplayStateTreeModule`** if you go the State Tree route. Add them to `PublicDependencyModuleNames` and note that a `.Build.cs` change forces a **full rebuild with the editor closed** — Live Coding cannot pick up a new module dependency.
+`AIModule`, `NavigationSystem` and `GameplayTasks` are present in `PublicDependencyModuleNames` with a comment explaining why. If you go anywhere near State Tree you'd need `StateTreeModule` + `GameplayStateTreeModule` added too — and any `.Build.cs` change forces a **full rebuild with the editor closed**; Live Coding cannot pick up a new module dependency.
 
-Also check that the **`AIModule`/navigation plugins are enabled** in `FPS.uproject` if a State Tree or the AI debugger doesn't resolve; the uproject currently lists `ModelingToolsEditorMode`, `AnimationWarping`, `CommonUI`, `ModelContextProtocol`, `Terminal`, `AllToolsets`, `AudioModulation` and nothing AI-specific.
+### 4. Nav mesh coverage is per-map and probably still missing
 
-### 4. There is probably no nav mesh in any map
-
-Assume no `NavMeshBoundsVolume` exists. Adding one is an editor/level operation — do it over the Unreal MCP connection if a toolset supports it, otherwise give Toby exact steps (which map, volume extents, `Project Settings → Navigation Mesh` agent radius/height to match the capsule, and `Show → Navigation` / press `P` to verify green coverage). Also relevant: this game's arenas are **vertical and stacked**, and a Recast nav mesh handles verticality poorly across gaps — which is exactly why the movement-tech layer and Nav Link Proxies matter, and why you should say so rather than pretending the nav mesh solves traversal.
+Do **not** assume a `NavMeshBoundsVolume` exists in the map Toby is testing in — check, and say what you found. Adding one is an editor/level operation: do it over the Unreal MCP connection if a toolset supports it, otherwise give exact steps (which map, volume extents, `Project Settings → Navigation Mesh` agent radius/height to match the capsule, `Show → Navigation` / press `P` to verify green coverage). Also relevant: this game's arenas are **vertical and stacked**, and a Recast nav mesh handles verticality poorly across gaps — which is exactly why the movement-tech layer and Nav Link Proxies matter. Say that rather than pretending the nav mesh solves traversal.
 
 ### 5. Driving predicted movement from an AI controller
 
 `UShooterMovementComponent` prediction exists to reconcile a *remote client* with the server. A bot has no client: its controller runs on the authority, so `SetWantsToSprint` / `RequestSlide` / `Jump` take effect immediately and the compressed-flag round trip is simply unused. That's fine — but it means:
 
-- **Wall run needs real movement input, not a teleport.** `TryStartWallRun` gates on horizontal speed (`WallRunMinSpeed`), a side trace (`WallRunTraceDistance`, `WallRunMaxWallNormalZ`), ground clearance, vertical speed, and **movement input pointing along the character's forward vector** (`WallRunMinForwardInputDot`). Path following supplies `Acceleration`, so the input exists — but if the bot's control rotation isn't facing along its path (and it often won't be, because it's looking at the player), the forward-dot check fails and the wall run never starts. Reconcile "look at target" against "face along travel" deliberately; that tension is the single fiddliest part of this feature.
+- **Wall run needs real movement input, not a teleport.** `TryStartWallRun` gates on horizontal speed (`WallRunMinSpeed`), a side trace (`WallRunTraceDistance`, `WallRunMaxWallNormalZ`), ground clearance, vertical speed, and **movement input pointing along the character's forward vector** (`WallRunMinForwardInputDot`). Path following supplies `Acceleration`, so the input exists — but if the bot's control rotation isn't facing along its path (and it often won't be, because it's looking at the player), the forward-dot check fails and the wall run never starts. **This is already reconciled** by `UShooterAIAimComponent::SetYawLockToTravel(bool, const FVector&)`, which the movement-tech component drives (`WantsYawLockedToTravel`) to force the yaw along travel while committing to a wall run. It is the single fiddliest part of this feature — understand that handshake before changing either side, and note the cost: while yaw is locked to travel, the bot is not tracking the player.
 - **The double jump is directional and reads movement input.** `AShooterCharacter::OnJumped_Implementation` redirects horizontal momentum onto the *input* direction using `DoubleJumpRedirectAlpha` / `DoubleJumpDirectionalBoost`. A bot that jumps with no movement input gets `DoubleJumpMinRedirectSpeed` and nothing else.
 - **Slide gating:** `CanStartSlide` needs sprinting + grounded + `SlideMinStartSpeed`, and respects `SlideCooldown`. Don't spam `RequestSlide()` — check `IsSliding()` and the speed first, and remember the slide is deliberately still `MOVE_Walking`.
 - Never write velocity or `SetActorLocation` directly to fake movement tech. It desyncs simulated proxies and bypasses every rule above.
 
-## Architecture — recommended shape
+## Architecture — the established shape, keep to it
 
-Propose this to Toby before building, adjust to what he wants, and build it in layers so each is testable:
+The three-layer split already in the source is the intended one. Extend within it rather than adding a fourth home for AI logic:
 
-- **`AShooterAIController : AAIController`** (`Source/FPS/Public/AI/ShooterAIController.h`) — owns perception, the target reference, the aim simulation, and hosts the behaviour asset. Server-only.
-- **Perception:** `UAIPerceptionComponent` with sight (and later hearing — gunfire is a huge tell in a 1v1). For a 1v1 you may not need the full perception system; a direct LOS trace to the single opponent plus a reaction-time delay and a "last known position" memory is simpler, cheaper and easier to tune. **Recommend the simpler one first** and say why.
-- **Decision layer:** a Behaviour Tree + Blackboard, with the real logic in C++ `UBTTask_*` / `UBTService_*` nodes rather than in Blueprint. State Tree is the modern UE5 alternative and is a better fit for "engage / reposition / reload / retreat" as exclusive states — pick one, justify it in one sentence, and don't mix both. BT is the better-documented choice for a learning project.
-- **`UAICombatComponent` (or logic on the controller):** aim simulation — clamp control-rotation change to a max turn rate, add a reaction delay before first acquiring, apply an aim-error offset that shrinks the longer the target is tracked, lead a moving target imperfectly, and decide burst length / when to release the trigger. This is where difficulty lives. Fire through `UCombatComponent::Initiate_FireWeapon_Pressed`, never by calling `DoDamage` directly.
-- **`UAIMovementTechComponent` (or a BT service):** watches the current path segment and the world and decides when to sprint, slide, double jump, wall run and wall jump. Everything it does goes through the movement component's public API.
-- **`ABotCharacter : AShooterCharacter`** only if the bot genuinely needs different behaviour (e.g. the 1P/3P montage issue above). Prefer reusing `BP_ShooterCharacter` with a different controller class if you can.
+- **`AShooterAIController : AAIController`** — perception, target reference, the state machine, and move-goal management. Server-only.
+- **`UShooterAIAimComponent`** — everything about where the bot is looking and when it pulls the trigger: turn-rate cap, reaction delay, aim error that shrinks with tracking time, target leading, burst length, ADS. **This is where difficulty is expressed.** It fires through `UCombatComponent::Initiate_FireWeapon_Pressed`, never by calling `DoDamage` directly — keep it that way.
+- **`UShooterAIMovementTechComponent`** — watches the path segment and the world and decides when to sprint, slide, double jump, wall run and wall jump. Everything goes through `UShooterMovementComponent`'s public API.
 
-Difficulty: one `UDataAsset` or `USTRUCT` of the human-limitation knobs, with a few authored presets. Do not scatter difficulty floats across three classes.
+Rules of thumb for where new behaviour belongs: *what to do* → controller state machine; *where to look / when to shoot* → aim component; *how to travel* → movement-tech component. Difficulty knobs go in `ShooterAITypes.h` with the rest, never scattered across the three classes.
+
+`ABotCharacter : AShooterCharacter` still doesn't exist and shouldn't unless the bot genuinely needs different pawn behaviour — `BP_EnemyBot` plus the AI controller class is the current arrangement.
 
 ### Project conventions — match these
 
@@ -158,7 +156,7 @@ If you can't build, say the code is **unverified** and name what you couldn't ch
 
 ### Coordination with the other agents
 
-`player-movement` owns `AShooterCharacter` locomotion and `UShooterMovementComponent`; `weapon` owns `UCombatComponent`, `AWeapon`, `UWeaponData` and the HUD. You will need small changes in both (the `WeaponTrace` controller cast, possibly the 1P/3P branch). Rules:
+`player-movement` owns `AShooterCharacter` locomotion and `UShooterMovementComponent`; `weapon` owns `UCombatComponent`, `AWeapon`, `UWeaponData` and the HUD. The shared-file changes the bot needed (the `WeaponTrace` controller cast, `IsFirstPersonViewer()`) are **already made** — you should rarely need another. Rules:
 
 - **Consume their APIs; don't reshape them.** Prefer adding to `IPlayerInterface` over casting or over changing existing behaviour.
 - Any edit you make outside `Source/FPS/*/AI/` must be **minimal, behaviour-preserving for the human player, and explicitly called out** in your report as a shared-file change, with what it was and why the AI needed it.
@@ -166,4 +164,4 @@ If you can't build, say the code is **unverified** and name what you couldn't ch
 
 ### Reporting back
 
-Concise summary of: the layers you built and in which files, what the bot currently decides and from what inputs, which movement tech it uses and under what conditions, which shared files you touched and why, any editor-side steps he still has to do by hand (nav mesh volume, BT/BB assets, controller class assignment on the pawn Blueprint, `AIControllerClass` + `Auto Possess AI` settings), whether it compiled, and the difficulty/tuning knobs with their default values.
+Concise summary of: what you changed and in which of the three layers, what the bot currently decides and from what inputs, which movement tech it uses and under what conditions, which shared files you touched and why, any editor-side steps he still has to do by hand (nav mesh volume, controller class assignment on the pawn Blueprint, `AIControllerClass` + `Auto Possess AI` settings), whether it compiled, and the difficulty/tuning knobs with their default values. If anything in this agent file turned out to be stale, say so.

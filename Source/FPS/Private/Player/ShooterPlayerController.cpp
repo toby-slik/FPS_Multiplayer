@@ -198,6 +198,22 @@ void AShooterPlayerController::BeginPlay()
 	}
 }
 
+void AShooterPlayerController::SetPawn(APawn* InPawn)
+{
+	Super::SetPawn(InPawn);
+
+	// A pawn arriving is the only thing that clears the death gate. Losing one re-arms it, which covers the
+	// window between UnPossess and the next spawn as well as the spectating case.
+	const bool bHasPawn = IsValid(InPawn);
+	bPawnAlive = bHasPawn;
+
+	if (bHasPawn)
+	{
+		// Recoil state belongs to the body that generated it - see the note in AShooterCharacter::OnDeathStarted.
+		ResetViewRecoil();
+	}
+}
+
 void AShooterPlayerController::SetupInputComponent()
 {
 	Super::SetupInputComponent();

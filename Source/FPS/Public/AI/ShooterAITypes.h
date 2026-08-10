@@ -157,15 +157,40 @@ struct FShooterBotDifficulty
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tactics", meta = (ClampMin = "0.02"))
 	float DecisionInterval = 0.25f;
 
-	/** Range the bot tries to hold while engaging, in cm. It closes when further than this and backs off
-	 *  when much closer. Scaled per weapon by AShooterAIController::GetPreferredRange. */
+	/**
+	 * Range the bot tries to hold while engaging, in cm. It closes when further than this and backs off when
+	 * much closer. Scaled per weapon by AShooterAIController::GetPreferredRange, which multiplies it by 1.6
+	 * for a semi-automatic.
+	 *
+	 * Size this against the *map*, not against the weapon: the bot backpedals to re-open the gap whenever it
+	 * is closer than this, so a preferred range above roughly a third of the arena's shortest span produces a
+	 * bot that spends the duel retreating to a wall because there is nowhere else to hold the range from.
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tactics", meta = (ClampMin = "100.0"))
-	float PreferredEngagementRange = 1200.f;
+	float PreferredEngagementRange = 600.f;
 
-	/** Probability that, on any given decision tick while engaging, the bot breaks the current angle and
-	 *  crosses to a new one instead of continuing to trade from where it stands. */
+	/**
+	 * Probability **per second** that an engaging bot breaks the current angle and crosses to a new one
+	 * instead of continuing to trade from where it stands.
+	 *
+	 * Per second, not per decision tick. The distinction is not cosmetic: DecisionInterval is 0.25s by
+	 * default, so a value read per tick fires four times as often as it reads, and because the bot cannot
+	 * shoot at all while repositioning (UpdateTrigger requires the Engage state) that turns a 15% flourish
+	 * into roughly half of every second spent running with the trigger down. AShooterAIController::DecideState
+	 * converts this to a per-tick probability.
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tactics", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float RepositionChance = 0.15f;
+
+	/**
+	 * Longest a single reposition may run before the bot goes back to fighting, even if it has not arrived.
+	 *
+	 * Without a cap the only exit from Reposition is reaching the goal, and the goal sits on a ring of
+	 * RepositionSearchRadius - so one reposition costs the whole traversal at walk speed with the trigger
+	 * released. A reposition is meant to be a step off the current angle, not a lap of the arena.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tactics", meta = (ClampMin = "0.1"))
+	float RepositionMaxDuration = 1.6f;
 };
 
 /**
@@ -210,6 +235,7 @@ inline FShooterBotDifficulty GetShooterBotDifficultyPreset(EShooterBotSkill Skil
 		D.BurstRestMax = 0.38f;
 		D.MovementTechChance = 0.9f;
 		D.RepositionChance = 0.25f;
+		D.RepositionMaxDuration = 2.f;
 		D.RetreatHealthFraction = 0.22f;
 		break;
 

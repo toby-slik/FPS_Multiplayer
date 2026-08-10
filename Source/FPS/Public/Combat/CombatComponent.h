@@ -12,6 +12,8 @@
 
 class UAttachmentData;
 class UMaterialInstanceDynamic;
+class USoundBase;
+class USoundConcurrency;
 class UWeaponData;
 class AWeapon;
 
@@ -223,6 +225,47 @@ private:
 	 */
 	UFUNCTION(Client, Unreliable)
 	void Client_ConfirmHit(bool bLethal, bool bHeadshot, float DamageDealt);
+
+	// --- Hit confirmation audio ----------------------------------------------------------------------
+
+	/**
+	 * Plays the confirm tone 2D for the instigating player only. Called from Client_ConfirmHit, so it
+	 * inherits that path's guarantee that the hit was scored by the authority - the shooter never hears a
+	 * click for a round their own optimistic trace thought landed.
+	 */
+	void Local_PlayHitConfirmSound(bool bLethal, bool bHeadshot) const;
+
+	/** Resolves the per-weapon override first, then the component default, then the plain hit sound. */
+	USoundBase* SelectHitConfirmSound(bool bLethal, bool bHeadshot) const;
+
+	/** The global confirm tone. Required - the other two only exist to specialise it. */
+	UPROPERTY(EditDefaultsOnly, Category = "FPS|HitMarker")
+	TObjectPtr<USoundBase> HitConfirmSound;
+
+	/** Optional. Unset means a headshot sounds like any other hit; the marker still turns gold. */
+	UPROPERTY(EditDefaultsOnly, Category = "FPS|HitMarker")
+	TObjectPtr<USoundBase> HitConfirmSound_Headshot;
+
+	/** Optional. Unset means a kill sounds like any other hit; the marker still turns red. */
+	UPROPERTY(EditDefaultsOnly, Category = "FPS|HitMarker")
+	TObjectPtr<USoundBase> HitConfirmSound_Lethal;
+
+	UPROPERTY(EditDefaultsOnly, Category = "FPS|HitMarker", meta = (ClampMin = "0.0"))
+	float HitConfirmVolume;
+
+	UPROPERTY(EditDefaultsOnly, Category = "FPS|HitMarker", meta = (ClampMin = "0.0"))
+	float HitConfirmPitch;
+
+	/**
+	 * Optional voice cap for the confirm tone. Worth assigning one: an automatic landing every round starts
+	 * a new 2D voice per hit, and a dozen overlapping copies of the same short transient sums into a
+	 * clipped buzz rather than reading as twelve hits. A concurrency of 2-3 with Stop Oldest keeps it crisp.
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "FPS|HitMarker")
+	TObjectPtr<USoundConcurrency> HitConfirmConcurrency;
+
+	/** Latch so the "no confirm sound assigned" warning is logged once, not once per landed round. */
+	mutable bool bHasWarnedMissingHitConfirmSound;
 
 	/**
 	 * Authority-only. True when Hit names one of the target's headshot bones AND the claim survives

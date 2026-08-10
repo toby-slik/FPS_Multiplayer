@@ -80,6 +80,19 @@ public:
 	
 	UFUNCTION(BlueprintCallable)
 	bool HasCurrentWeapon() const;
+
+	/**
+	 * The FOV the equipped weapon aims down, with attachments applied, falling back to DefaultFOV when there
+	 * is no weapon. This is the far end of the ADS blend, so it deliberately does not care whether the player
+	 * is currently aiming - the blend alpha owns that.
+	 *
+	 * Drive the aim blend from this rather than reaching through Combat->CurrentWeapon in Blueprint. There are
+	 * two ordinary moments with no weapon at all - between spawn and the inventory arriving, and from death
+	 * until the respawned pawn is equipped - and a graph that reads the weapon directly logs an
+	 * "Accessed None" every frame through both of them.
+	 */
+	UFUNCTION(BlueprintPure, Category = "FPS|Aiming")
+	float GetWeaponAimFieldOfView() const;
 	
 	UPROPERTY(BlueprintAssignable)
 	FWeaponFirstReplicated OnWeaponFirstReplicated;

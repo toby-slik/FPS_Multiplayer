@@ -210,6 +210,19 @@ bool AShooterCharacter::HasCurrentWeapon() const
 	return IsValid(Combat) && Combat->CurrentWeapon != nullptr;
 }
 
+float AShooterCharacter::GetWeaponAimFieldOfView() const
+{
+	if (!IsValid(Combat) || !IsValid(Combat->CurrentWeapon))
+	{
+		return DefaultFOV;
+	}
+
+	// Effective, not the raw AimFieldOfView the graph used to read: an optic's FOV multiplier is an
+	// attachment stat, so reading the base property meant scopes changed nothing about how far the ADS
+	// blend pulled in.
+	return Combat->CurrentWeapon->GetEffectiveAimFieldOfView();
+}
+
 void AShooterCharacter::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);

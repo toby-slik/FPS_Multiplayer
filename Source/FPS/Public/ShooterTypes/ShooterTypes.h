@@ -5,6 +5,7 @@
 #include "ShooterTypes.generated.h"
 
 class UCameraShakeBase;
+class USoundBase;
 
 UENUM(BlueprintType)
 enum class ETurnInPlace : uint8
@@ -370,4 +371,23 @@ struct FHitMarkerParams
 	 */
 	UPROPERTY(BlueprintReadWrite, EditAnywhere)
 	FLinearColor HitMarkerColor_Lethal = FLinearColor(1.f, 0.04f, 0.05f, 1.f);
+
+	// Hit Marker - audio.
+	// All three are optional per-weapon overrides. Left unset (the default) the weapon falls back to the
+	// matching HitConfirmSound* on UCombatComponent, which is where the one global confirm tone is assigned.
+	// They live here rather than only on the component because a weapon's confirm tone is part of its
+	// identity - a suppressed sidearm should be able to click rather than chime - and per the equipment
+	// pillar that has to be authorable per weapon rather than branched on weapon type in code.
+
+	/** Confirm tone for an ordinary body hit. Unset = use UCombatComponent::HitConfirmSound. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	TObjectPtr<USoundBase> HitMarkerSound;
+
+	/** Unset falls back to the component's headshot sound, then to the plain hit sound above. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	TObjectPtr<USoundBase> HitMarkerSound_Headshot;
+
+	/** Unset falls back to the component's lethal sound, then to the plain hit sound above. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	TObjectPtr<USoundBase> HitMarkerSound_Lethal;
 };

@@ -20,6 +20,12 @@ AShooterAIController::AShooterAIController()
 {
 	PrimaryActorTick.bCanEverTick = true;
 
+	// Required for the bot to survive its own death. AController::PawnPendingDestroy destroys any controller
+	// that has no PlayerState the moment its pawn is destroyed, so without this the controller died with the
+	// body and the respawn request was handed an already-destroyed controller - which is why a killed bot
+	// never came back. With a PlayerState the controller outlives the pawn and can be re-possessed.
+	bWantsPlayerState = true;
+
 	// The bot writes its own control rotation every frame from the aim component. Left at its default this
 	// would overwrite that with the pawn's current orientation, and the bot would never turn onto a target.
 	bSetControlRotationFromPawnOrientation = false;
@@ -38,7 +44,9 @@ AShooterAIController::AShooterAIController()
 	SightHalfAngleDegrees = 80.f;
 	HearingRange = 4000.f;
 	TargetRefreshInterval = 0.5f;
-	RepositionSearchRadius = 1400.f;
+	// Sized so a reposition is a step off the current angle rather than a lap of the arena - the bot holds the
+	// trigger released for the whole of one, so the radius is a direct cost in shots not taken.
+	RepositionSearchRadius = 800.f;
 	GoalAcceptanceRadius = 120.f;
 	ReloadWatchdogTime = 3.f;
 	HuntRepathInterval = 2.5f;
@@ -423,7 +431,13 @@ EShooterBotState AShooterAIController::DecideState() const
 	{
 		// Already committed to crossing to a new angle - let it finish rather than snapping back to Engage
 		// the instant sight is regained, which would leave the bot jittering on the spot.
+		//
+		// Bounded by RepositionMaxDuration as well as by arrival. Arrival alone is not enough: the goal sits on
+		// a ring of RepositionSearchRadius and the bot cannot fire outside Engage, so a long or awkward path
+		// turns one reposition into several seconds of running with the trigger down - which reads exactly like
+		// a bot that is ignoring the fight to get somewhere.
 		if (BotState == EShooterBotState::Reposition && bHasMoveGoal &&
+			StateTime < Difficulty.RepositionMaxDuration &&
 			FVector::Dist(Bot->GetActorLocation(), MoveGoal) > GoalAcceptanceRadius)
 		{
 			return EShooterBotState::Reposition;
@@ -432,7 +446,15 @@ EShooterBotState AShooterAIController::DecideState() const
 		// Occasionally refuse a winnable trade and move instead. This is what stops the bot from standing in
 		// one doorway for a whole duel, and it is the cheapest single behaviour that makes it feel like it
 		// has a plan.
-		if (BotState == EShooterBotState::Engage && FMath::FRand() < Difficulty.RepositionChance)
+		//
+		// RepositionChance is authored per second, so it has to be converted to this tick's probability rather
+		// than compared directly: rolling a per-second figure once per DecisionInterval fires it 1/Interval
+		// times as often as authored. Surviving n = 1/Interval ticks without repositioning must come to
+		// (1 - Chance), so each tick's probability is 1 - (1 - Chance)^Interval.
+		const float TickRepositionChance =
+			1.f - FMath::Pow(1.f - FMath::Clamp(Difficulty.RepositionChance, 0.f, 1.f), Difficulty.DecisionInterval);
+
+		if (BotState == EShooterBotState::Engage && FMath::FRand() < TickRepositionChance)
 		{
 			return EShooterBotState::Reposition;
 		}

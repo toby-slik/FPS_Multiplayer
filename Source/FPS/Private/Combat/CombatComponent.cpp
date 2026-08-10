@@ -12,10 +12,13 @@
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PawnMovementComponent.h"
 #include "Interfaces/PlayerInterface.h"
+#include "Kismet/GameplayStatics.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "Net/UnrealNetwork.h"
 #include "PhysicalMaterials/PhysicalMaterial.h"
 #include "Player/ShooterPlayerController.h"
+#include "Sound/SoundBase.h"
+#include "UObject/ConstructorHelpers.h"
 #include "Weapon/Weapon.h"
 
 
@@ -33,6 +36,20 @@ UCombatComponent::UCombatComponent()
 	TargetingTraceAccumulator = 0.f;
 	HeadshotValidationTolerance = 120.f;
 	bValidateHeadshotBonePosition = true;
+	HitConfirmVolume = 1.f;
+	HitConfirmPitch = 1.f;
+	bHasWarnedMissingHitConfirmSound = false;
+
+	// The confirm tone is defaulted in code rather than left for a Blueprint to fill in. With every slot in
+	// the fallback chain null, SelectHitConfirmSound returns null and Local_PlayHitConfirmSound returns early -
+	// which is indistinguishable from the feature being switched off, and is exactly how hit-confirm audio
+	// went missing. A weapon's HitMarkerParams, or the component's own Blueprint defaults, still override this.
+	static ConstructorHelpers::FObjectFinder<USoundBase> DefaultHitConfirmSound(
+		TEXT("/Game/Audio/Sounds/Weapons/hitmarker_2.hitmarker_2"));
+	if (DefaultHitConfirmSound.Succeeded())
+	{
+		HitConfirmSound = DefaultHitConfirmSound.Object;
+	}
 }
 
 void UCombatComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -232,6 +249,59 @@ void UCombatComponent::Client_ReloadWeapon_Implementation(int32 NewWeaponAmmo, i
 void UCombatComponent::Client_ConfirmHit_Implementation(bool bLethal, bool bHeadshot, float DamageDealt)
 {
 	OnHitConfirmed.Broadcast(bLethal, bHeadshot, DamageDealt);
+	Local_PlayHitConfirmSound(bLethal, bHeadshot);
+}
+
+void UCombatComponent::Local_PlayHitConfirmSound(bool bLethal, bool bHeadshot) const
+{
+	// A Client_ RPC on a locally controlled authority pawn simply executes locally, which is exactly what
+	// puts the confirm tone in a listen-server host's own ears with no separate host path. The same rule is
+	// the trap here though: an AI bot is locally controlled on the authority too, so a bot's confirmation
+	// would run on the host and play a 2D sound for a hit the host *took*. IsOwnerFirstPerson() is the
+	// "there is a human viewing through these eyes" test and is the only correct gate - IsLocallyControlled()
+	// would let the bot through, and it also keeps a dedicated server silent.
+	if (!IsOwnerFirstPerson()) return;
+
+	USoundBase* Sound = SelectHitConfirmSound(bLethal, bHeadshot);
+	if (!IsValid(Sound))
+	{
+		// Warned once per component, not per round: with nothing assigned this branch is hit at the weapon's
+		// full rate of fire. Silence here used to look identical to a broken RPC or a bad net gate, so the
+		// log is the difference between a five-minute fix and an afternoon spent bisecting the fire path.
+		if (!bHasWarnedMissingHitConfirmSound)
+		{
+			bHasWarnedMissingHitConfirmSound = true;
+			UE_LOG(LogTemp, Warning,
+				TEXT("Hit confirmed on %s but no hit-confirm sound resolved: assign HitConfirmSound on the CombatComponent, or HitMarkerParams.HitMarkerSound on %s."),
+				*GetNameSafe(GetOwner()), *GetNameSafe(CurrentWeapon));
+		}
+		return;
+	}
+
+	UGameplayStatics::PlaySound2D(this, Sound, HitConfirmVolume, HitConfirmPitch, 0.f, HitConfirmConcurrency);
+}
+
+USoundBase* UCombatComponent::SelectHitConfirmSound(bool bLethal, bool bHeadshot) const
+{
+	const FHitMarkerParams* WeaponParams = IsValid(CurrentWeapon) ? &CurrentWeapon->HitMarkerParams : nullptr;
+
+	// Lethal outranks headshot, matching how the marker's colours are layered in UShooterReticle - a
+	// killing headshot is a kill first. Each state falls through weapon override, then component default,
+	// then the plain hit tone, so a project that only ever assigns HitConfirmSound still gets every state.
+	if (bLethal)
+	{
+		if (WeaponParams && IsValid(WeaponParams->HitMarkerSound_Lethal)) return WeaponParams->HitMarkerSound_Lethal;
+		if (IsValid(HitConfirmSound_Lethal)) return HitConfirmSound_Lethal;
+	}
+
+	if (bHeadshot)
+	{
+		if (WeaponParams && IsValid(WeaponParams->HitMarkerSound_Headshot)) return WeaponParams->HitMarkerSound_Headshot;
+		if (IsValid(HitConfirmSound_Headshot)) return HitConfirmSound_Headshot;
+	}
+
+	if (WeaponParams && IsValid(WeaponParams->HitMarkerSound)) return WeaponParams->HitMarkerSound;
+	return HitConfirmSound;
 }
 
 bool UCombatComponent::Auth_IsHeadshot(const FHitResult& Hit) const
