@@ -48,6 +48,7 @@ void UShooterReticle::NativeOnInitialized()
 	_BaseShapeCutFactor_Aiming = 0.f;
 	_BaseCornerScaleFactor_Spread = 0.f;
 	_BaseCornerScaleFactor_TargetingPlayer = 0.f;
+	_AimAlpha = 0.f;
 	_HitMarkerIntensity = 0.f;
 	_HitMarkerLethal = 0.f;
 	_HitMarkerHeadshot = 0.f;
@@ -143,7 +144,11 @@ void UShooterReticle::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
 	
 	_BaseCornerScaleFactor_Aiming = FMath::FInterpTo(_BaseCornerScaleFactor_Aiming, bAiming? CurrentReticleParams.ScaleFactor_Aiming : CurrentReticleParams.ScaleFactor_NotAiming, InDeltaTime, CurrentReticleParams.AimingInterpSpeed);
 	_BaseShapeCutFactor_Aiming = FMath::FInterpTo(_BaseShapeCutFactor_Aiming, bAiming ? CurrentReticleParams.ShapeCutFactor_Aiming : CurrentReticleParams.ShapeCutFactor_NotAiming, InDeltaTime, CurrentReticleParams.AimingInterpSpeed);
-	
+
+	// Normalised twin of the two _Aiming offsets above, on the same interp speed so every hip/ADS pair below
+	// crossfades on one curve and no single term arrives at the ADS look ahead of the others.
+	_AimAlpha = FMath::FInterpTo(_AimAlpha, bAiming ? 1.f : 0.f, InDeltaTime, CurrentReticleParams.AimingInterpSpeed);
+
 	_BaseCornerScaleFactor_TargetingPlayer = FMath::FInterpTo(_BaseCornerScaleFactor_TargetingPlayer, bTargetingPlayer ? CurrentReticleParams.ScaleFactor_Targeting : CurrentReticleParams.ScaleFactor_NotTargeting, InDeltaTime, CurrentReticleParams.TargetingPlayerInterpSpeed);
 	
 	// Driven by the weapon's live recoil heat rather than by the fire event, which makes this the one
@@ -154,14 +159,49 @@ void UShooterReticle::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
 	// Expressed as a multiple of the already-authored per-shot term so it inherits that term's sign - the
 	// reticle material's convention for "open" is not knowable here, and getting it backwards would tighten
 	// the crosshair as the cone widens.
+	// The multiple itself is crossfaded hip-to-ADS, so aiming quietens the cone report without silencing it.
+	const float SpreadMultiplier = FMath::Lerp(CurrentReticleParams.SpreadScaleMultiplier, CurrentReticleParams.SpreadScaleMultiplier_Aiming, _AimAlpha);
 	const float TargetSpreadScale = CurrentReticleParams.ScaleFactor_RoundFired
-		* CurrentReticleParams.SpreadScaleMultiplier
+		* SpreadMultiplier
 		* GetCurrentSpreadAlpha();
 	_BaseCornerScaleFactor_Spread = FMath::FInterpTo(_BaseCornerScaleFactor_Spread, TargetSpreadScale, InDeltaTime, CurrentReticleParams.SpreadInterpSpeed);
 
-	BaseCornerScaleFactor = _BaseCornerScaleFactor_RoundFired + _BaseCornerScaleFactor_Aiming + _BaseCornerScaleFactor_TargetingPlayer + _BaseCornerScaleFactor_Spread;
-	BaseShapeCutFactor = _BaseShapeCutFactor_RoundFired + _BaseShapeCutFactor_Aiming;
-	
+	// Both dynamic terms are unbounded accumulators, and past some value the material's RoundedCornerScale
+	// and ShapeCutThickness degenerate and the reticle renders nothing at all - which happens precisely when
+	// the player is spraying and needs it most. Capped here as well as at accumulation so the tighter ADS
+	// ceiling still applies to a value that was banked while hip-firing.
+	//
+	// Clamped by MAGNITUDE, not with FMath::Min: these terms inherit ScaleFactor_RoundFired's sign, which is
+	// this weapon's reticle material's convention for "open" and is allowed to be negative. A one-sided Min
+	// would be a no-op on a negative-opening reticle and would leave it just as broken.
+	//
+	// The authored _Aiming and _TargetingPlayer offsets stay outside the cap deliberately - they are static
+	// authored values rather than runaway accumulators, and capping them would fight the designer's own
+	// ADS reticle size.
+	float DynamicCornerScale = _BaseCornerScaleFactor_RoundFired + _BaseCornerScaleFactor_Spread;
+	float DynamicShapeCut = _BaseShapeCutFactor_RoundFired;
+
+	// A near-zero authored per-shot term makes the cap zero, and clamping to it would erase the whole
+	// dynamic contribution - including the spread term, which is authored as a multiple of that term but may
+	// still be wanted. A weapon that opts out of the per-shot bloom has not asked for its cone report to be
+	// silenced too, so the clamp is skipped entirely rather than applied at zero.
+	if (FMath::Abs(CurrentReticleParams.ScaleFactor_RoundFired) > KINDA_SMALL_NUMBER)
+	{
+		const float MaxScaleMultiplier = FMath::Lerp(CurrentReticleParams.MaxDynamicScaleMultiplier, CurrentReticleParams.MaxDynamicScaleMultiplier_Aiming, _AimAlpha);
+		const float CornerScaleCap = FMath::Abs(CurrentReticleParams.ScaleFactor_RoundFired * MaxScaleMultiplier);
+		DynamicCornerScale = FMath::Clamp(DynamicCornerScale, -CornerScaleCap, CornerScaleCap);
+	}
+
+	if (FMath::Abs(CurrentReticleParams.ShapeCutFactor_RoundFired) > KINDA_SMALL_NUMBER)
+	{
+		const float MaxShapeCutMultiplier = FMath::Lerp(CurrentReticleParams.MaxDynamicShapeCutMultiplier, CurrentReticleParams.MaxDynamicShapeCutMultiplier_Aiming, _AimAlpha);
+		const float ShapeCutCap = FMath::Abs(CurrentReticleParams.ShapeCutFactor_RoundFired * MaxShapeCutMultiplier);
+		DynamicShapeCut = FMath::Clamp(DynamicShapeCut, -ShapeCutCap, ShapeCutCap);
+	}
+
+	BaseCornerScaleFactor = DynamicCornerScale + _BaseCornerScaleFactor_Aiming + _BaseCornerScaleFactor_TargetingPlayer;
+	BaseShapeCutFactor = DynamicShapeCut + _BaseShapeCutFactor_Aiming;
+
 	if (CurrentReticle_DynMatInst.IsValid())
 	{
 		CurrentReticle_DynMatInst->SetScalarParameterValue(Reticle::RoundedCornerScale, BaseCornerScaleFactor);
@@ -369,8 +409,28 @@ void UShooterReticle::OnRoundFired(int32 RoundsCurrent, int32 RoundsMax, int32 R
 {
 	_BaseCornerScaleFactor_RoundFired += CurrentReticleParams.ScaleFactor_RoundFired;
 	_BaseShapeCutFactor_RoundFired += CurrentReticleParams.ShapeCutFactor_RoundFired;
-	
-	
+
+	// Clamped here as well as in NativeTick, and for a different reason. Capping only at read time still
+	// lets a long burst bank a large value in the accumulator itself, which then keeps decaying for seconds
+	// after the trigger is released - so the crosshair reads pinned wide open long after the player stopped
+	// firing. Same fix OnHitConfirmed already applies with HitMarkerIntensityMax.
+	//
+	// Against the HIP cap only: clamping to the tighter ADS ceiling here would permanently destroy the
+	// accumulated value, and the reticle would not re-open on leaving ADS. The tick clamp owns ADS.
+	// Magnitude clamp, and the near-zero skip, for the same reasons documented at the tick clamp.
+	if (FMath::Abs(CurrentReticleParams.ScaleFactor_RoundFired) > KINDA_SMALL_NUMBER)
+	{
+		const float CornerScaleCap = FMath::Abs(CurrentReticleParams.ScaleFactor_RoundFired * CurrentReticleParams.MaxDynamicScaleMultiplier);
+		_BaseCornerScaleFactor_RoundFired = FMath::Clamp(_BaseCornerScaleFactor_RoundFired, -CornerScaleCap, CornerScaleCap);
+	}
+
+	if (FMath::Abs(CurrentReticleParams.ShapeCutFactor_RoundFired) > KINDA_SMALL_NUMBER)
+	{
+		const float ShapeCutCap = FMath::Abs(CurrentReticleParams.ShapeCutFactor_RoundFired * CurrentReticleParams.MaxDynamicShapeCutMultiplier);
+		_BaseShapeCutFactor_RoundFired = FMath::Clamp(_BaseShapeCutFactor_RoundFired, -ShapeCutCap, ShapeCutCap);
+	}
+
+
 	if (CurrentAmmoCounter_DynMatInst.IsValid())
 	{
 		CurrentAmmoCounter_DynMatInst->SetScalarParameterValue(Ammo::Rounds_Current, RoundsCurrent);

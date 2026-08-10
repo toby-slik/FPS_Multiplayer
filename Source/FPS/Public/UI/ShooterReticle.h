@@ -83,6 +83,15 @@ private:
 
 	/** Sustained opening that tracks the weapon's real bullet cone. See the note at its use in NativeTick. */
 	float _BaseCornerScaleFactor_Spread;
+
+	/**
+	 * Normalised 0-1 ADS blend, driven at AimingInterpSpeed so it moves in lockstep with the authored
+	 * _Base*_Aiming offsets. Deliberately NOT those offsets reused: they interp toward authored values in
+	 * reticle units, which are neither normalised nor guaranteed to be 0 at the hip, so they cannot drive a
+	 * lerp. Everything that has a hip/ADS pair crossfades on this one alpha, so the whole reticle arrives at
+	 * the ADS look on the same curve and no single term pops ahead of the others.
+	 */
+	float _AimAlpha;
 	float _HitMarkerIntensity;
 	float _HitMarkerLethal;
 	float _HitMarkerHeadshot;

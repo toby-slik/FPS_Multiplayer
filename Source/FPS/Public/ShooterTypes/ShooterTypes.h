@@ -97,6 +97,51 @@ struct FReticleParams
 	/** How quickly the spread term follows the real cone. Fast on purpose - a laggy crosshair misinforms. */
 	UPROPERTY(BlueprintReadWrite, EditAnywhere)
 	float SpreadInterpSpeed = 18.f;
+
+	/**
+	 * SpreadScaleMultiplier's ADS counterpart, crossfaded to as the player aims. Separate from the hip value
+	 * because the reticle has a different job in each stance: from the hip it is the only report of a cone
+	 * the player cannot otherwise see, while down the sights the cone is already narrow (AimSpreadMultiplier)
+	 * and the crosshair is competing with the weapon's own sights for the same few pixels. Defaulted to 1
+	 * rather than to the hip value so ADS still reports the cone honestly, just without the theatrics.
+	 */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	float SpreadScaleMultiplier_Aiming = 1.f;
+
+	/**
+	 * Ceiling on the COMBINED dynamic corner-scale opening (the per-shot bloom plus the spread term),
+	 * as a multiple of ScaleFactor_RoundFired. Both terms are unbounded on their own: the per-shot bloom is
+	 * a += accumulator that under held auto-fire gains faster than RoundFiredInterpSpeed sheds it, and past
+	 * some value the reticle material's RoundedCornerScale degenerates and the crosshair renders *nothing*.
+	 * A crosshair that disappears exactly when the player is spraying is the worst possible failure mode.
+	 *
+	 * A multiple rather than an absolute number for the same reason SpreadScaleMultiplier is - it inherits
+	 * this weapon's authored sign and magnitude. The clamp is applied by magnitude, not by FMath::Min, so a
+	 * weapon whose reticle opens negative is bounded rather than ignored.
+	 */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	float MaxDynamicScaleMultiplier = 4.f;
+
+	/**
+	 * The same ceiling while aiming down sights, crossfaded to on the ADS transition. Much tighter on
+	 * purpose: ADS is the precision stance, and a crosshair that blooms as wide as the hip-fire one defeats
+	 * the point of entering it. This is a HUD constraint only - it does not narrow the actual cone, which is
+	 * FRecoilParams::AimSpreadMultiplier's job.
+	 */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	float MaxDynamicScaleMultiplier_Aiming = 1.5f;
+
+	/**
+	 * Ceiling on the per-shot shape-cut accumulator, as a multiple of ShapeCutFactor_RoundFired. Same
+	 * unbounded-accumulator failure as MaxDynamicScaleMultiplier, on the material's other channel: past some
+	 * value ShapeCutThickness degenerates and the reticle's arms cut themselves away to nothing.
+	 */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	float MaxDynamicShapeCutMultiplier = 4.f;
+
+	/** The shape-cut ceiling while aiming. Tighter than the hip value for the same reason the scale one is. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere)
+	float MaxDynamicShapeCutMultiplier_Aiming = 1.5f;
 };
 
 /**
