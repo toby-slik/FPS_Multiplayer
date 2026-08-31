@@ -17,6 +17,7 @@
 #include "Net/UnrealNetwork.h"
 #include "PhysicalMaterials/PhysicalMaterial.h"
 #include "Player/ShooterPlayerController.h"
+#include "ShooterGameModeBase.h"
 #include "Sound/SoundBase.h"
 #include "UObject/ConstructorHelpers.h"
 #include "Weapon/Weapon.h"
@@ -1036,8 +1037,22 @@ void UCombatComponent::SpawnInventory()
 	AActor* OwningActor = GetOwner();
 	if (!IsValid(OwningActor) || !OwningActor->HasAuthority() || bInventorySpawned) return;
 	bInventorySpawned = true;
-	
-	for (const TSubclassOf<AWeapon>& WeaponClass : DefaultWeaponClass)
+
+	// The game mode gets first say on the kit. This is how the campaign hands out a pistol in the first
+	// arena and a wider loadout later without needing a pawn Blueprint per level. An empty answer - which
+	// is what the base mode always gives - means "use the pawn's own list", so the 1v1 path is unchanged.
+	TArray<TSubclassOf<AWeapon>> Loadout;
+	if (const AShooterGameModeBase* GM = Cast<AShooterGameModeBase>(UGameplayStatics::GetGameMode(OwningActor)))
+	{
+		const APawn* OwningPawn = Cast<APawn>(OwningActor);
+		GM->GetStartingLoadout(IsValid(OwningPawn) ? OwningPawn->GetController() : nullptr, Loadout);
+	}
+	if (Loadout.IsEmpty())
+	{
+		Loadout = DefaultWeaponClass;
+	}
+
+	for (const TSubclassOf<AWeapon>& WeaponClass : Loadout)
 	{
 		if (!IsValid(WeaponClass.Get()))
 		{

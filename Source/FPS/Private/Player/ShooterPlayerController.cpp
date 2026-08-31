@@ -196,6 +196,15 @@ void AShooterPlayerController::BeginPlay()
 	{
 		Subsystem->AddMappingContext(ShooterIMC, 0);
 	}
+
+	// Claim game input explicitly rather than relying on it being the default.
+	//
+	// SetInputMode writes to the game viewport client, not to the controller, and the viewport outlives a
+	// level change - so a UI-only mode set by the main menu is still in force on the first frame of the map
+	// it opened, and the fresh controller here would never see a key. Asserting it once, on every gameplay
+	// map, is what stops any future menu, pause screen or post-match UI from leaking its mode into a match.
+	SetInputMode(FInputModeGameOnly());
+	SetShowMouseCursor(false);
 }
 
 void AShooterPlayerController::SetPawn(APawn* InPawn)

@@ -70,6 +70,17 @@ public:
 
 	const FShooterBotDifficulty& GetDifficulty() const { return Difficulty; }
 
+	/**
+	 * Swaps the difficulty preset at runtime. Skill is EditDefaultsOnly, so without this a bot's difficulty
+	 * is fixed by its Blueprint - the campaign needs the same bot Blueprint to be Recruit in the first arena
+	 * and Veteran in the last.
+	 *
+	 * Custom is honoured: it leaves the hand-authored numbers alone rather than stamping a preset over them.
+	 * Safe to call mid-fight; every consumer reads Difficulty live.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "FPS|AI|Difficulty")
+	void SetSkill(EShooterBotSkill NewSkill);
+
 	UShooterAIBlackboard* GetKnowledge() const { return Knowledge; }
 
 	EShooterBotAction GetAction() const { return CurrentAction; }

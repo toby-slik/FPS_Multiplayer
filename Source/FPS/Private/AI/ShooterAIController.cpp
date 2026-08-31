@@ -103,10 +103,7 @@ void AShooterAIController::BeginPlay()
 	Super::BeginPlay();
 
 	// Custom means "the numbers on the Blueprint are the truth" - see the note on the property.
-	if (Skill != EShooterBotSkill::Custom)
-	{
-		Difficulty = GetShooterBotDifficultyPreset(Skill);
-	}
+	SetSkill(Skill);
 
 	// Every component is ticked by hand from this class so the order within a frame is fixed: knowledge,
 	// then decision, then locomotion, then aim. Aim runs last because a traversal yaw claim has to be raised
@@ -122,6 +119,15 @@ void AShooterAIController::BeginPlay()
 	if (IsValid(MovementTech))
 	{
 		MovementTech->SetComponentTickEnabled(false);
+	}
+}
+
+void AShooterAIController::SetSkill(EShooterBotSkill NewSkill)
+{
+	Skill = NewSkill;
+	if (Skill != EShooterBotSkill::Custom)
+	{
+		Difficulty = GetShooterBotDifficultyPreset(Skill);
 	}
 }
 
