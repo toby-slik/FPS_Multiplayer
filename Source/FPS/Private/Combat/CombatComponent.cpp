@@ -894,6 +894,11 @@ void UCombatComponent::Multicast_ReloadWeapon_Implementation()
 
 void UCombatComponent::Initiate_Aim_Pressed()
 {
+	// No weapon, no ADS. The character Blueprint's aim timeline reads CurrentWeapon's aim FOV every
+	// tick it runs, so broadcasting an aim with nothing equipped (a campaign level before its pickup)
+	// is a null access per frame, not just a no-op.
+	if (!IsValid(CurrentWeapon)) return;
+
 	// Aiming cancels sprint, then always proceeds. The gate is on the sprint state only,
 	// so aiming stays available while airborne, sliding and later wall-running.
 	CancelOwnerSprint();
@@ -915,6 +920,14 @@ void UCombatComponent::Server_Aim_Implementation(bool bPressed)
 
 void UCombatComponent::Local_Aim(bool bPressed)
 {
+	// Release arrives even when the press was refused for having no weapon; the timeline listener
+	// would still dereference CurrentWeapon on the way back down.
+	if (!IsValid(CurrentWeapon))
+	{
+		bAiming = false;
+		return;
+	}
+
 	bAiming = bPressed;
 	OnAimingStatusChanged.Broadcast(bAiming);
 }
@@ -1039,15 +1052,21 @@ void UCombatComponent::SpawnInventory()
 	bInventorySpawned = true;
 
 	// The game mode gets first say on the kit. This is how the campaign hands out a pistol in the first
-	// arena and a wider loadout later without needing a pawn Blueprint per level. An empty answer - which
-	// is what the base mode always gives - means "use the pawn's own list", so the 1v1 path is unchanged.
+	// arena and a wider loadout later without needing a pawn Blueprint per level. An empty answer from a
+	// mode that does not override the loadout at all - the base mode, always - means "use the pawn's own
+	// list", so the 1v1 path is unchanged. A mode that does override it (ShouldOverrideStartingLoadout) can
+	// still mean "start with nothing", which is how the campaign sends a player into a pickup-only level
+	// unarmed rather than quietly falling back to the pawn's defaults.
 	TArray<TSubclassOf<AWeapon>> Loadout;
+	bool bGameModeOverridesLoadout = false;
 	if (const AShooterGameModeBase* GM = Cast<AShooterGameModeBase>(UGameplayStatics::GetGameMode(OwningActor)))
 	{
 		const APawn* OwningPawn = Cast<APawn>(OwningActor);
-		GM->GetStartingLoadout(IsValid(OwningPawn) ? OwningPawn->GetController() : nullptr, Loadout);
+		const AController* OwningController = IsValid(OwningPawn) ? OwningPawn->GetController() : nullptr;
+		GM->GetStartingLoadout(OwningController, Loadout);
+		bGameModeOverridesLoadout = GM->ShouldOverrideStartingLoadout(OwningController);
 	}
-	if (Loadout.IsEmpty())
+	if (Loadout.IsEmpty() && !bGameModeOverridesLoadout)
 	{
 		Loadout = DefaultWeaponClass;
 	}
@@ -1088,6 +1107,62 @@ void UCombatComponent::SpawnInventory()
 	{
 		bInventorySpawned = false;
 	}
+}
+
+EWeaponGrantResult UCombatComponent::Auth_GrantWeapon(TSubclassOf<AWeapon> WeaponClass, bool bEquipIfUnarmed)
+{
+	AActor* OwningActor = GetOwner();
+	if (!IsValid(OwningActor)) return EWeaponGrantResult::Failed;
+	if (!OwningActor->HasAuthority()) return EWeaponGrantResult::Failed;
+	if (!IsValid(WeaponClass.Get())) return EWeaponGrantResult::Failed;
+
+	// Checked off the class default object first so a weapon the pawn already owns is never spawned at all.
+	// ReserveAmmo is keyed by WeaponType, so two weapons sharing a tag would share one reserve pool.
+	if (const AWeapon* WeaponCDO = WeaponClass->GetDefaultObject<AWeapon>())
+	{
+		if (ReserveAmmo.Contains(WeaponCDO->WeaponType)) return EWeaponGrantResult::AlreadyOwned;
+	}
+
+	AWeapon* Weapon = SpawnWeapon(WeaponClass);
+	if (!IsValid(Weapon))
+	{
+		UE_LOG(LogTemp, Error, TEXT("Failed to spawn granted weapon class %s for %s"),
+			*GetNameSafe(WeaponClass.Get()), *GetNameSafe(OwningActor));
+		return EWeaponGrantResult::Failed;
+	}
+
+	// Re-checked against the spawned actor rather than trusting the CDO test above: a Blueprint is free to
+	// set WeaponType from its construction script, in which case the instance's tag is not the CDO's.
+	if (ReserveAmmo.Contains(Weapon->WeaponType))
+	{
+		Weapon->Destroy();
+		return EWeaponGrantResult::AlreadyOwned;
+	}
+
+	Inventory.Add(Weapon);
+	ReserveAmmo.Add(Weapon->WeaponType, Weapon->StartingCarriedAmmo);
+
+	// Appending never shifts an existing index, so Local_WeaponIndex still points at the weapon in hand on
+	// every machine, and both of the new weapon's meshes stay hidden until AttachToOwningPawn runs - a
+	// weapon that joins the inventory without being equipped is invisible and inert until it is cycled to.
+	if (!IsValid(CurrentWeapon) && bEquipIfUnarmed)
+	{
+		// SpawnInventory leaves bInventorySpawned false when the game mode deliberately handed out nothing,
+		// so the pawn can still be given a kit later. It has one now, so latch it: a re-possession running
+		// the initial-spawn path again would re-equip Inventory[0] out from under the player.
+		bInventorySpawned = true;
+		Local_WeaponIndex = Inventory.Num() - 1;
+		Equip(Weapon);
+
+		// The owning client is driven by OnRep_CurrentWeapon, which calls this itself. A listen-server host
+		// never receives its own replication, so its HUD - which has had no reticle or ammo counter at all
+		// while the player was unarmed - is only initialised here.
+		InitializeWeaponWidgets();
+	}
+
+	OwningActor->ForceNetUpdate();
+
+	return EWeaponGrantResult::Granted;
 }
 
 void UCombatComponent::DestroyInventory()

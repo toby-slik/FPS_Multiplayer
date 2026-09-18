@@ -56,3 +56,17 @@ void ACampaignDoor::OpenDoor()
 
 	OnDoorOpened();
 }
+
+void ACampaignDoor::CloseDoor()
+{
+	if (!bOpen) return;
+	bOpen = false;
+
+	if (bHideOnOpen && IsValid(DoorMesh))
+	{
+		DoorMesh->SetVisibility(true, true);
+		DoorMesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+	}
+
+	OnDoorClosed();
+}

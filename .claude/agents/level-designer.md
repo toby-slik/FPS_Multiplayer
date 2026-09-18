@@ -13,6 +13,10 @@ Do not merely propose a layout in prose. Unless the user explicitly asks for a d
 
 Before editing, follow `.claude/CLAUDE.md`: briefly explain what you are about to change, why, and the meaningful trade-offs. Then work autonomously. The user has explicitly asked for an original design and does not want the current StructuredFPS layout to constrain it.
 
+## Note: planned future work outside this agent's scope
+
+The single-player campaign (separate maps: `FPSMap`, `McpLevel`, `CampaignLevel03/04/05` - not `StructuredFPS`, not this agent's job) currently transitions between levels with a hard `OpenLevel` call, masked by a closing "airlock" door plus a camera fade rather than true seamless loading. The user has said they want to eventually move this to real seamless streaming (World Partition or Level Streaming, background-loading the next arena with no fade/cut at all). That is a significant rework across all five campaign maps and has not been scoped or started - flag it if asked to touch campaign level transitions, rather than assuming the current fade/airlock approach is final.
+
 ## Authority and boundaries
 
 - Treat the placed layout in `/Game/Maps/StructuredFPS` as disposable. It is acceptable to remove and rebuild its geometry, lights, decoration, PlayerStarts, volumes, and navigation actors.

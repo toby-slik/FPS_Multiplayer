@@ -25,6 +25,23 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FTargetingPlayerStatusChanged, bool,
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FCurrentReserveAmmoChanged, int32, RoundsInReserve, int32, RoundsInWeapon, UMaterialInterface*, WeaponIconMaterial);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FHitConfirmed, bool, bLethal, bool, bHeadshot, float, DamageDealt);
 
+/** Outcome of UCombatComponent::Auth_GrantWeapon. A pickup uses this to decide whether to consume itself. */
+UENUM(BlueprintType)
+enum class EWeaponGrantResult : uint8
+{
+	/** A weapon was spawned, added to the inventory and given its reserve ammo. */
+	Granted,
+
+	/**
+	 * The pawn already carries a weapon with this WeaponType, so nothing changed. Not a failure: reserve ammo
+	 * is keyed by weapon-type tag, so a second copy would share - and fight over - one reserve pool.
+	 */
+	AlreadyOwned,
+
+	/** No authority, an invalid class, or the spawn itself failed. */
+	Failed
+};
+
 UCLASS(ClassGroup=(Custom), meta=(BlueprintSpawnableComponent))
 class FPS_API UCombatComponent : public UActorComponent
 {
@@ -82,6 +99,25 @@ public:
 	
 	void SpawnInventory();
 	void DestroyInventory();
+
+	/**
+	 * Authority-only runtime addition of one weapon to this pawn's inventory - the campaign weapon pickup's
+	 * entry point, and the hook a post-match award would use later.
+	 *
+	 * Deliberately not routed through SpawnInventory(): that is a one-time initial-spawn path, latched by
+	 * bInventorySpawned, which also re-equips Inventory[0] - running it again to add a gun would swap the
+	 * weapon out of the player's hands as a side effect.
+	 *
+	 * There is no Initiate_/Server_ pair and no client path, for the same reason Auth_EquipAttachment has
+	 * none: every caller already runs on the authority, and nothing about picking a gun off the floor needs
+	 * to feel instant enough to predict. The owning client learns what it is now carrying from the replicated
+	 * Inventory and CurrentWeapon.
+	 *
+	 * bEquipIfUnarmed only equips when the pawn is holding nothing at all. A pickup should never yank the
+	 * weapon the player is currently shooting with out of their hands mid-level.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "FPS|Weapon")
+	EWeaponGrantResult Auth_GrantWeapon(TSubclassOf<AWeapon> WeaponClass, bool bEquipIfUnarmed = true);
 	
 	UPROPERTY(BlueprintReadOnly, Replicated)
 	bool bAiming;

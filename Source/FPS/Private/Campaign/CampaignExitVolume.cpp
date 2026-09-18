@@ -2,6 +2,7 @@
 
 #include "Campaign/CampaignExitVolume.h"
 
+#include "Campaign/CampaignDoor.h"
 #include "Campaign/CampaignGameMode.h"
 #include "Components/BoxComponent.h"
 #include "GameFramework/Pawn.h"
@@ -36,6 +37,11 @@ void ACampaignExitVolume::HandleOverlap(UPrimitiveComponent* OverlappedComponent
 	if (!IsValid(GM)) return;
 
 	if (bRequireArenaCleared && !GM->IsArenaCleared()) return;
+
+	if (IsValid(AirlockDoor))
+	{
+		AirlockDoor->CloseDoor();
+	}
 
 	GM->AdvanceToNextLevel();
 }

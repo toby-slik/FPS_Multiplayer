@@ -37,9 +37,26 @@ public:
 	 *  PlayerDeathBehaviour instead of by the base class's random-PlayerStart respawn. */
 	virtual void RequestRespawn(ACharacter* Character, AController* Controller) override;
 
-	/** The player's kit is the cumulative unlock list up to the current level; bots take the level's
-	 *  BotWeapons when it specifies any. */
+	/**
+	 * The player's kit is the cumulative unlock list up to but NOT including the current level; bots take
+	 * the level's BotWeapons when it specifies any.
+	 *
+	 * A level that introduces a new weapon (WeaponsUnlocked non-empty) is deliberately left out of the
+	 * player's spawn kit - that weapon is a ACampaignWeaponPickup placed in the level instead, so "unlocked"
+	 * reads as "found here" rather than appearing in the player's hands at spawn. Levels that unlock nothing
+	 * new are unaffected: the cumulative kit is identical either way.
+	 */
 	virtual void GetStartingLoadout(const AController* Controller, TArray<TSubclassOf<AWeapon>>& OutWeapons) const override;
+
+	/** The campaign always decides the *player's* kit, even when that kit is deliberately empty (the level
+	 *  starts the player unarmed, ahead of a weapon pickup). Bots are not overridden: an empty BotWeapons
+	 *  still means "keep the Blueprint's own weapon". See UCombatComponent::SpawnInventory. */
+	virtual bool ShouldOverrideStartingLoadout(const AController* Controller) const override;
+
+	/** Resolves the level index and loads the save here, not in BeginPlay: the local player is spawned and
+	 *  possessed during map load, before any actor's BeginPlay, and GetStartingLoadout needs the index by
+	 *  then. Level 0 masked this - its default index happened to be right. */
+	virtual void InitGame(const FString& MapName, const FString& Options, FString& ErrorMessage) override;
 
 	/** Index of the level being played. Resolved from the level set by map name, falling back to the save. */
 	UFUNCTION(BlueprintPure, Category = "Campaign")
@@ -95,12 +112,22 @@ protected:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Campaign", meta = (AllowedClasses = "/Script/Engine.World"))
 	TSoftObjectPtr<UWorld> CampaignCompleteLevel;
 
-	/** Seconds between hitting the exit volume and the next map opening, so a transition can play. */
+	/** Seconds between hitting the exit volume and the next map opening, so a transition can play. Also the
+	 *  duration of the fade-to-black that masks that load - see AdvanceToNextLevel. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Campaign", meta = (ClampMin = "0.0"))
 	float LevelTransitionDelay = 0.5f;
 
+	/** Seconds to fade in from black when a level starts, so arriving in the next arena is not a hard cut
+	 *  from the previous level's fade-out. 0 disables the fade-in. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Campaign", meta = (ClampMin = "0.0"))
+	float LevelFadeInDuration = 0.4f;
+
 	UFUNCTION()
 	void HandleEnemyDeath();
+
+	/** Fades every local player's camera to or from black. Used for the airlock-style transition between
+	 *  levels rather than a hard cut - see AdvanceToNextLevel and BeginPlay. */
+	void FadeLocalPlayerCameras(float FromAlpha, float ToAlpha, float Duration, bool bHoldWhenFinished) const;
 
 private:
 

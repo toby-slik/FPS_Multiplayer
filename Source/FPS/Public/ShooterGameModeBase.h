@@ -33,6 +33,15 @@ public:
 	virtual void GetStartingLoadout(const AController* Controller, TArray<TSubclassOf<AWeapon>>& OutWeapons) const {}
 
 	/**
+	 * True if an empty GetStartingLoadout means "start with nothing" rather than "no override, use the
+	 * pawn's own DefaultWeaponClass". The base mode never distinguishes the two, since it never overrides
+	 * the loadout at all. The campaign does: a level that introduces a new weapon as a pickup starts the
+	 * player with last level's kit only, and an empty array there is a deliberate no-weapon-yet moment, not
+	 * a "no override" signal.
+	 */
+	virtual bool ShouldOverrideStartingLoadout(const AController* Controller) const { return false; }
+
+	/**
 	 * Sends AI controllers to BotPawnClass and everyone else to DefaultPawnClass.
 	 *
 	 * RequestRespawn routes through RestartPlayerAtPlayerStart, which asks this function what to spawn. Without

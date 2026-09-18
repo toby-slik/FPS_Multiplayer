@@ -50,6 +50,7 @@ UE **5.8**, module `FPS`, project root `C:\Users\Toby Crust\Documents\GitHub\FPS
 | `Source/FPS/Public/Player/ShooterPlayerController.h` / `.cpp` | Binds Move/Look/Jump/Crouch and adds `ShooterIMC`. Weapon input (fire/aim/reload/cycle) is bound on the **character**, not here — always check both classes when chasing an input binding. |
 | `Content/UI/Hud/Art/` | HUD materials: `M_UI_Base_ReticleBuilder`, `MI_UI_Reticles_*`, `M_UI_Base_AmmoCounter`, `MI_UI_AmmoCounter_*`, `CA_UI_HUD`. New HUD materials belong here, named to match. |
 | `Content/FPS/Input/` | `IMC_Shooter` + `IA_*`. Weapon keys: Fire LMB, Aim RMB, Reload R, Cycle (see `IA_CycleWeapon`). |
+| `Source/FPS/Public/Campaign/*` | The single-player campaign (`ACampaignGameMode`, `ACampaignDoor`, `ACampaignExitVolume`, `UCampaignLevelSet`/`FCampaignLevel`, `ACampaignWeaponPickup`). It is the other caller of your starting-loadout path: `AShooterGameModeBase::GetStartingLoadout` / `ShouldOverrideStartingLoadout` decide what `UCombatComponent::SpawnInventory` hands the player at spawn, and `ACampaignWeaponPickup` calls `UCombatComponent::Auth_GrantWeapon` to hand over a level's newly-unlocked weapon at runtime instead. `UHealthComponent::OnDeathStarted` is also what `ACampaignGameMode` listens to for "the arena's bot died, open the door" — don't assume `HealthComponent` death is 1v1-only when touching it. |
 
 ### Project conventions — match these
 

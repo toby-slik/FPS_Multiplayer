@@ -7,6 +7,7 @@
 #include "CampaignExitVolume.generated.h"
 
 class UBoxComponent;
+class ACampaignDoor;
 
 /**
  * The end of the traversal section. Walking into it takes the player to the next campaign level.
@@ -38,4 +39,14 @@ protected:
 	/** Refuse the transition until the arena's bot is dead. Guards against a route that skips the fight. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Campaign")
 	bool bRequireArenaCleared = true;
+
+	/**
+	 * Optional door the player has already walked through by the time they reach this volume - place it in
+	 * the corridor behind this trigger, not past it. Closed the instant the player triggers the transition,
+	 * sealing the small chamber between that door and this volume into an airlock the player cannot walk
+	 * back out of while the level change plays out. Left unset, the transition still works exactly as
+	 * before, just without the seal.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Campaign")
+	TObjectPtr<ACampaignDoor> AirlockDoor;
 };
